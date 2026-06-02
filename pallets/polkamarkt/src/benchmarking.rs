@@ -26,6 +26,24 @@ fn default_condition_input<T: crate::Config>() -> ConditionInput {
     }
 }
 
+fn default_condition_details<T: crate::Config>() -> ConditionDetailsInput {
+    let metadata_len = T::MaxMetadataLength::get();
+    ConditionDetailsInput {
+        category: repeated_bytes(b'C', metadata_len),
+        tags: repeated_bytes(b'T', metadata_len),
+        metadata_uri: repeated_bytes(b'M', metadata_len),
+        metadata_hash: Some([7; 32]),
+        rules_uri: repeated_bytes(b'R', metadata_len),
+    }
+}
+
+fn default_evidence<T: crate::Config>() -> EvidenceInput {
+    EvidenceInput {
+        uri: repeated_bytes(b'E', T::MaxMetadataLength::get()),
+        hash: Some([9; 32]),
+    }
+}
+
 fn bench_balance<T>(amount: u32) -> BenchBalanceOf<T>
 where
     T: crate::Config,
@@ -53,24 +71,11 @@ where
     mint_canonical_balance::<T>(who, amount);
 }
 
-fn benchmark_bond_amount<T>() -> BenchBalanceOf<T>
-where
-    T: crate::Config,
-{
-    let min = T::GovernanceBondMinimum::get();
-    if min.is_zero() {
-        BenchBalanceOf::<T>::one()
-    } else {
-        min
-    }
-}
-
 fn setup_creator_market<T>(caller: &T::AccountId, seed: BenchBalanceOf<T>)
 where
     T: crate::Config + frame_system::Config,
     T::AccountId: Clone,
 {
-    GovernanceBonds::<T>::insert(caller, T::GovernanceBondMinimum::get());
     fund_canonical_fee::<T>(caller);
     mint_canonical_balance::<T>(caller, seed);
     let metadata = default_condition_input::<T>();
@@ -79,8 +84,67 @@ where
     let close = <frame_system::Pallet<T>>::block_number()
         + T::MinMarketDuration::get()
         + BlockNumberFor::<T>::one();
-    Pallet::<T>::create_market(RawOrigin::Signed(caller.clone()).into(), 0, close, seed)
-        .expect("market setup");
+    T::Assets::transfer(
+        T::CanonicalStableAssetId::get(),
+        caller,
+        &Pallet::<T>::account_id(),
+        seed,
+    )
+    .expect("legacy seed transfer");
+    Markets::<T>::insert(
+        0,
+        Market {
+            creator: caller.clone(),
+            condition_id: 0,
+            close_block: close,
+            collateral_asset: T::CanonicalStableAssetId::get(),
+            seed_liquidity: seed,
+            mechanism: MarketMechanism::LegacyAmm,
+            status: MarketStatus::Open,
+        },
+    );
+    MarketPools::<T>::insert(
+        0,
+        MarketPool {
+            collateral: seed,
+            yes: seed,
+            no: seed,
+        },
+    );
+    LiquidityPositions::<T>::insert(
+        0,
+        caller,
+        LiquidityPosition {
+            shares: seed,
+            collateral_contributed: seed,
+        },
+    );
+    LiquidityPositionTotals::<T>::insert(
+        0,
+        LiquidityTotals {
+            total_shares: seed,
+            total_collateral_contributed: seed,
+        },
+    );
+    ConditionMarket::<T>::insert(0, 0);
+    NextMarketId::<T>::put(1);
+}
+
+fn setup_orderbook_market<T>(caller: &T::AccountId) -> BlockNumberFor<T>
+where
+    T: crate::Config + frame_system::Config,
+    T::AccountId: Clone,
+{
+    fund_canonical_fee::<T>(caller);
+    let metadata = default_condition_input::<T>();
+    Pallet::<T>::create_condition(RawOrigin::Signed(caller.clone()).into(), metadata)
+        .expect("condition setup");
+    let close = <frame_system::Pallet<T>>::block_number()
+        + T::MinMarketDuration::get()
+        + BlockNumberFor::<T>::one();
+    Pallet::<T>::create_market(RawOrigin::Signed(caller.clone()).into(), 0, close)
+        .expect("order-book market setup");
+    close
 }
 
 fn market_close_block<T>() -> BlockNumberFor<T>
@@ -175,7 +239,7 @@ mod benchmarks {
     #[benchmark]
     fn create_condition() {
         let caller: T::AccountId = whitelisted_caller();
-        GovernanceBonds::<T>::insert(&caller, T::GovernanceBondMinimum::get());
+        fund_canonical_fee::<T>(&caller);
         let metadata = default_condition_input::<T>();
 
         #[extrinsic_call]
@@ -183,29 +247,20 @@ mod benchmarks {
     }
 
     #[benchmark]
-    fn create_opengov_condition() {
+    fn create_condition_with_details() {
         let caller: T::AccountId = whitelisted_caller();
-        GovernanceBonds::<T>::insert(&caller, T::GovernanceBondMinimum::get());
+        fund_canonical_fee::<T>(&caller);
         let metadata = default_condition_input::<T>();
-        let proposal = OpengovProposalInput {
-            network: RelayNetwork::Polkadot,
-            parachain_id: 1,
-            track_id: 1,
-            referendum_index: 1,
-            plaza_tag: repeated_bytes(b'P', T::MaxPlazaTagLength::get()),
-        };
+        let details = default_condition_details::<T>();
 
         #[extrinsic_call]
-        create_opengov_condition(RawOrigin::Signed(caller), metadata, proposal);
+        create_condition_with_details(RawOrigin::Signed(caller), metadata, details);
     }
 
     #[benchmark]
     fn create_market() {
         let caller: T::AccountId = whitelisted_caller();
-        GovernanceBonds::<T>::insert(&caller, T::GovernanceBondMinimum::get());
         fund_canonical_fee::<T>(&caller);
-        let seed = bench_balance::<T>(10_000);
-        mint_canonical_balance::<T>(&caller, seed);
         let metadata = default_condition_input::<T>();
         Pallet::<T>::create_condition(RawOrigin::Signed(caller.clone()).into(), metadata)
             .expect("condition setup");
@@ -214,7 +269,7 @@ mod benchmarks {
             + BlockNumberFor::<T>::one();
 
         #[extrinsic_call]
-        create_market(RawOrigin::Signed(caller), 0, close, seed);
+        create_market(RawOrigin::Signed(caller), 0, close);
     }
 
     #[benchmark]
@@ -260,6 +315,48 @@ mod benchmarks {
     }
 
     #[benchmark]
+    fn flip_position() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
+        let trader: T::AccountId = account("trader", 0, 0);
+        mint_canonical_balance::<T>(&trader, bench_balance::<T>(20_000));
+        Pallet::<T>::buy(
+            RawOrigin::Signed(trader.clone()).into(),
+            0,
+            BinaryOutcome::Yes,
+            bench_balance::<T>(10_000),
+            BenchBalanceOf::<T>::zero(),
+        )
+        .expect("buy setup");
+
+        #[extrinsic_call]
+        flip_position(
+            RawOrigin::Signed(trader),
+            0,
+            BinaryOutcome::Yes,
+            bench_balance::<T>(5_000),
+            BenchBalanceOf::<T>::zero(),
+            BenchBalanceOf::<T>::zero(),
+        );
+    }
+
+    #[benchmark]
+    fn add_liquidity() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
+        let provider: T::AccountId = account("provider", 0, 0);
+        mint_canonical_balance::<T>(&provider, bench_balance::<T>(20_000));
+
+        #[extrinsic_call]
+        add_liquidity(
+            RawOrigin::Signed(provider),
+            0,
+            bench_balance::<T>(10_000),
+            BenchBalanceOf::<T>::zero(),
+        );
+    }
+
+    #[benchmark]
     fn sync_market_status() {
         let caller: T::AccountId = whitelisted_caller();
         setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
@@ -268,30 +365,6 @@ mod benchmarks {
 
         #[extrinsic_call]
         sync_market_status(RawOrigin::Signed(caller), 0);
-    }
-
-    #[benchmark]
-    fn bond_governance() {
-        let caller: T::AccountId = whitelisted_caller();
-        let amount = benchmark_bond_amount::<T>();
-        T::Assets::mint_for_bench(T::CanonicalStableAssetId::get(), &caller, amount)
-            .expect("bond funding");
-
-        #[extrinsic_call]
-        bond_governance(RawOrigin::Signed(caller), amount);
-    }
-
-    #[benchmark]
-    fn unbond_governance() {
-        let caller: T::AccountId = whitelisted_caller();
-        let amount = benchmark_bond_amount::<T>();
-        T::Assets::mint_for_bench(T::CanonicalStableAssetId::get(), &caller, amount)
-            .expect("bond funding");
-        Pallet::<T>::bond_governance(RawOrigin::Signed(caller.clone()).into(), amount)
-            .expect("bond setup");
-
-        #[extrinsic_call]
-        unbond_governance(RawOrigin::Signed(caller), amount);
     }
 
     #[benchmark]
@@ -306,6 +379,22 @@ mod benchmarks {
     }
 
     #[benchmark]
+    fn resolve_market_with_evidence() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
+        let close = market_close_block::<T>();
+        <frame_system::Pallet<T>>::set_block_number(close);
+
+        #[extrinsic_call]
+        resolve_market_with_evidence(
+            RawOrigin::Root,
+            0,
+            BinaryOutcome::Yes,
+            default_evidence::<T>(),
+        );
+    }
+
+    #[benchmark]
     fn cancel_market() {
         let caller: T::AccountId = whitelisted_caller();
         setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
@@ -314,6 +403,15 @@ mod benchmarks {
 
         #[extrinsic_call]
         cancel_market(RawOrigin::Root, 0);
+    }
+
+    #[benchmark]
+    fn emergency_cancel_market() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
+
+        #[extrinsic_call]
+        emergency_cancel_market(RawOrigin::Root, 0, default_evidence::<T>());
     }
 
     #[benchmark]
@@ -337,6 +435,85 @@ mod benchmarks {
 
         #[extrinsic_call]
         claim_market(RawOrigin::Signed(trader), 0);
+    }
+
+    #[benchmark]
+    fn claim_markets(n: Linear<1, { T::MaxBatchClaims::get() }>) {
+        let caller: T::AccountId = whitelisted_caller();
+        let trader: T::AccountId = account("trader", 0, 0);
+        let batch = n;
+        let seed = bench_balance::<T>(10_000);
+        let stake = bench_balance::<T>(1_000);
+        let mut market_ids = Vec::new();
+        for market_id in 0..batch {
+            fund_canonical_fee::<T>(&caller);
+            mint_canonical_balance::<T>(&caller, seed);
+            mint_canonical_balance::<T>(&trader, stake);
+            Pallet::<T>::create_condition(
+                RawOrigin::Signed(caller.clone()).into(),
+                default_condition_input::<T>(),
+            )
+            .expect("condition setup");
+            let close = <frame_system::Pallet<T>>::block_number()
+                + T::MinMarketDuration::get()
+                + BlockNumberFor::<T>::one();
+            Pallet::<T>::create_market(RawOrigin::Signed(caller.clone()).into(), market_id, close)
+                .expect("market setup");
+            T::Assets::transfer(
+                T::CanonicalStableAssetId::get(),
+                &caller,
+                &Pallet::<T>::account_id(),
+                seed,
+            )
+            .expect("legacy seed transfer");
+            Markets::<T>::mutate(market_id, |market| {
+                let market = market.as_mut().expect("created market");
+                market.seed_liquidity = seed;
+                market.mechanism = MarketMechanism::LegacyAmm;
+            });
+            MarketPools::<T>::insert(
+                market_id,
+                MarketPool {
+                    collateral: seed,
+                    yes: seed,
+                    no: seed,
+                },
+            );
+            LiquidityPositions::<T>::insert(
+                market_id,
+                &caller,
+                LiquidityPosition {
+                    shares: seed,
+                    collateral_contributed: seed,
+                },
+            );
+            LiquidityPositionTotals::<T>::insert(
+                market_id,
+                LiquidityTotals {
+                    total_shares: seed,
+                    total_collateral_contributed: seed,
+                },
+            );
+            Pallet::<T>::buy(
+                RawOrigin::Signed(trader.clone()).into(),
+                market_id,
+                BinaryOutcome::Yes,
+                stake,
+                BenchBalanceOf::<T>::zero(),
+            )
+            .expect("buy setup");
+            market_ids.push(market_id);
+        }
+        let close = market_close_block::<T>();
+        <frame_system::Pallet<T>>::set_block_number(close);
+        for market_id in 0..batch {
+            Pallet::<T>::resolve_market(RawOrigin::Root.into(), market_id, BinaryOutcome::Yes)
+                .expect("resolve setup");
+        }
+        let market_ids = market_ids.try_into().expect("bounded batch");
+
+        #[extrinsic_call]
+        claim_markets(RawOrigin::Signed(trader), market_ids);
     }
 
     #[benchmark]
@@ -372,6 +549,28 @@ mod benchmarks {
     }
 
     #[benchmark]
+    fn claim_liquidity() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_creator_market::<T>(&caller, bench_balance::<T>(100_000));
+        let provider: T::AccountId = account("provider", 0, 0);
+        mint_canonical_balance::<T>(&provider, bench_balance::<T>(20_000));
+        Pallet::<T>::add_liquidity(
+            RawOrigin::Signed(provider.clone()).into(),
+            0,
+            bench_balance::<T>(10_000),
+            BenchBalanceOf::<T>::zero(),
+        )
+        .expect("liquidity setup");
+        let close = market_close_block::<T>();
+        <frame_system::Pallet<T>>::set_block_number(close);
+        Pallet::<T>::resolve_market(RawOrigin::Root.into(), 0, BinaryOutcome::Yes)
+            .expect("resolve setup");
+
+        #[extrinsic_call]
+        claim_liquidity(RawOrigin::Signed(provider), 0, BenchBalanceOf::<T>::zero());
+    }
+
+    #[benchmark]
     fn sweep_xor_buyback_and_burn() {
         let unit: common::Balance = 1_000_000_000_000_000_000;
         let caller: T::AccountId = whitelisted_caller();
@@ -390,5 +589,86 @@ mod benchmarks {
 
         #[extrinsic_call]
         sweep_xor_buyback_and_burn(RawOrigin::Signed(caller));
+    }
+
+    #[benchmark]
+    fn place_order(f: Linear<1, { T::MaxFillsPerOrder::get() }>) {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_orderbook_market::<T>(&caller);
+        let taker: T::AccountId = account("taker", 0, 0);
+        let fills = f;
+        let shares_per_order = bench_balance::<T>(10_000);
+        let maker_shares = shares_per_order.saturating_mul(fills.into());
+        let taker_shares = maker_shares.saturating_add(shares_per_order);
+        mint_canonical_balance::<T>(&taker, taker_shares.saturating_mul(2u32.into()));
+        for maker_index in 0..fills {
+            let maker: T::AccountId = account("maker", maker_index, 0);
+            mint_canonical_balance::<T>(&maker, shares_per_order);
+            Pallet::<T>::place_order(
+                RawOrigin::Signed(maker).into(),
+                0,
+                BinaryOutcome::No,
+                OrderSide::Buy,
+                50,
+                shares_per_order,
+                TimeInForce::Gtc,
+            )
+            .expect("maker order setup");
+        }
+
+        #[extrinsic_call]
+        place_order(
+            RawOrigin::Signed(taker),
+            0,
+            BinaryOutcome::Yes,
+            OrderSide::Buy,
+            99,
+            taker_shares,
+            TimeInForce::Gtc,
+        );
+    }
+
+    #[benchmark]
+    fn cancel_order() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_orderbook_market::<T>(&caller);
+        mint_canonical_balance::<T>(&caller, bench_balance::<T>(1_000));
+        Pallet::<T>::place_order(
+            RawOrigin::Signed(caller.clone()).into(),
+            0,
+            BinaryOutcome::Yes,
+            OrderSide::Buy,
+            50,
+            bench_balance::<T>(100),
+            TimeInForce::Gtc,
+        )
+        .expect("order setup");
+
+        #[extrinsic_call]
+        cancel_order(RawOrigin::Signed(caller), 0);
+    }
+
+    #[benchmark]
+    fn split_position() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_orderbook_market::<T>(&caller);
+        let shares = bench_balance::<T>(100);
+        mint_canonical_balance::<T>(&caller, shares);
+
+        #[extrinsic_call]
+        split_position(RawOrigin::Signed(caller), 0, shares);
+    }
+
+    #[benchmark]
+    fn merge_positions() {
+        let caller: T::AccountId = whitelisted_caller();
+        setup_orderbook_market::<T>(&caller);
+        let shares = bench_balance::<T>(100);
+        mint_canonical_balance::<T>(&caller, shares);
+        Pallet::<T>::split_position(RawOrigin::Signed(caller.clone()).into(), 0, shares)
+            .expect("split setup");
+
+        #[extrinsic_call]
+        merge_positions(RawOrigin::Signed(caller), 0, shares);
     }
 }

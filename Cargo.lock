@@ -5160,6 +5160,7 @@ dependencies = [
  "pallet-sudo",
  "pallet-transaction-payment-rpc",
  "parity-scale-codec",
+ "polkamarkt-rpc",
  "pswap-distribution-rpc",
  "rewards-rpc",
  "sc-basic-authorship",
@@ -5342,6 +5343,7 @@ dependencies = [
  "parity-scale-codec",
  "parity-scale-codec-derive",
  "permissions",
+ "polkamarkt-runtime-api",
  "pool-xyk",
  "pool-xyk-benchmarking",
  "presto",
@@ -10383,6 +10385,30 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-primitives",
  "tracing-gum",
+]
+
+[[package]]
+name = "polkamarkt-rpc"
+version = "0.1.0"
+dependencies = [
+ "jsonrpsee",
+ "parity-scale-codec",
+ "polkamarkt-runtime-api",
+ "sp-api",
+ "sp-blockchain",
+ "sp-runtime",
+]
+
+[[package]]
+name = "polkamarkt-runtime-api"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "parity-scale-codec",
+ "scale-info",
+ "serde",
+ "sp-api",
+ "sp-runtime",
 ]
 
 [[package]]

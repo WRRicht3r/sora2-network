@@ -168,7 +168,10 @@ use hex_literal::hex;
 use pallet_grandpa::{
     fg_primitives, AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList,
 };
-use pallet_polkamarkt::AssetTransfer as PolkamarktAssetTransfer;
+use pallet_polkamarkt::{
+    AssetTransfer as PolkamarktAssetTransfer, BinaryOutcome as PolkamarktBinaryOutcome,
+    MarketStatus as PolkamarktMarketStatus, OrderSide as PolkamarktOrderSide,
+};
 use pallet_session::historical as pallet_session_historical;
 use snowbridge_beacon_primitives::{Fork, ForkVersions};
 use sp_api::impl_runtime_apis;
@@ -1120,20 +1123,21 @@ parameter_types! {
         "02000c0000000000000000000000000000000000000000000000000000000000"
     ));
     pub const PolkamarktMinQuestionLength: u32 = 32;
-    pub const PolkamarktCreationFeeBps: u32 = 35;
     pub const PolkamarktMinCreationFee: Balance = balance!(5);
     pub const PolkamarktMinMarketDuration: BlockNumber = 7_200;
     pub const PolkamarktMaxMetadataLength: u32 = 512;
-    pub const PolkamarktMaxPlazaTagLength: u32 = 64;
+    pub const PolkamarktMaxBatchClaims: u32 = 24;
+    pub const PolkamarktMaxFillsPerOrder: u32 = 24;
+    pub const PolkamarktMaxOrdersPerPrice: u32 = 128;
+    pub const PolkamarktMaxOpenOrdersPerAccountMarket: u32 = 128;
     pub const PolkamarktTradeFeeBps: u32 = 50;
-    pub PolkamarktGovernanceBondMinimum: Balance = balance!(5000);
 }
 
 parameter_types! {
     pub PolkamarktFeeCollector: AccountId = AccountId::new(hex!(
         "c0e6629c9baf600a20be6cdeda7545c03ae60175982debe124a369b9a1aa8a38"
     ));
-    pub PolkamarktCreatorBondEscrowAccount: AccountId = AccountId::new(hex!(
+    pub PolkamarktLegacyCreatorBondEscrowAccount: AccountId = AccountId::new(hex!(
         "9e6663fbfc3f0bd24b00f984adc0f4a585ccf84ab1bb1049433e9fa680f6c828"
     ));
 }
@@ -1325,20 +1329,20 @@ impl pallet_polkamarkt::Config for Runtime {
     type Balance = Balance;
     type FeeCollector = PolkamarktFeeCollector;
     type MinQuestionLength = PolkamarktMinQuestionLength;
-    type CreationFeeBps = PolkamarktCreationFeeBps;
     type MinCreationFee = PolkamarktMinCreationFee;
     type PalletId = PolkamarktPalletId;
+    type LegacyCreatorBondEscrowAccount = PolkamarktLegacyCreatorBondEscrowAccount;
     type BuyBackHandler = liquidity_proxy::LiquidityProxyBuyBackHandler<Runtime, GetBuyBackDexId>;
     type GetBuyBackAssetId = GetXorAssetId;
     type MinMarketDuration = PolkamarktMinMarketDuration;
     type MaxMetadataLength = PolkamarktMaxMetadataLength;
-    type MaxPlazaTagLength = PolkamarktMaxPlazaTagLength;
+    type MaxBatchClaims = PolkamarktMaxBatchClaims;
+    type MaxFillsPerOrder = PolkamarktMaxFillsPerOrder;
+    type MaxOrdersPerPrice = PolkamarktMaxOrdersPerPrice;
+    type MaxOpenOrdersPerAccountMarket = PolkamarktMaxOpenOrdersPerAccountMarket;
     type WeightInfo = weights::polkamarkt::SoraWeight<Runtime>;
     type TradeFeeBps = PolkamarktTradeFeeBps;
-    type GovernanceBondMinimum = PolkamarktGovernanceBondMinimum;
-    type CreatorBondEscrowAccount = PolkamarktCreatorBondEscrowAccount;
     type GovernanceOrigin = EnsureRoot<AccountId>;
-    type PlazaIntegration = pallet_polkamarkt::PolkadotPlazaBridge<Self>;
 }
 
 impl mock_liquidity_source::Config<mock_liquidity_source::Instance1> for Runtime {
@@ -2189,6 +2193,7 @@ impl pallet_mmr::Config for Runtime {
     type Hashing = Keccak256;
     type OnNewRoot = pallet_beefy_mmr::DepositBeefyDigest<Runtime>;
     type BlockHashProvider = pallet_mmr::DefaultBlockHashProvider<Self>;
+    #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = ();
     type WeightInfo = ();
     type LeafData = pallet_beefy_mmr::Pallet<Runtime>;
@@ -3535,6 +3540,45 @@ pub type Executive = frame_executive::Executive<
 #[cfg(feature = "wip")] // Trustless bridges
 pub type MmrHashing = <Runtime as pallet_mmr::Config>::Hashing;
 
+fn polkamarkt_outcome_from_string(outcome: String) -> Option<PolkamarktBinaryOutcome> {
+    match outcome.as_bytes() {
+        b"YES" | b"Yes" | b"yes" => Some(PolkamarktBinaryOutcome::Yes),
+        b"NO" | b"No" | b"no" => Some(PolkamarktBinaryOutcome::No),
+        _ => None,
+    }
+}
+
+fn polkamarkt_outcome_label(outcome: PolkamarktBinaryOutcome) -> String {
+    match outcome {
+        PolkamarktBinaryOutcome::Yes => String::from("Yes"),
+        PolkamarktBinaryOutcome::No => String::from("No"),
+    }
+}
+
+fn polkamarkt_order_side_from_string(side: String) -> Option<PolkamarktOrderSide> {
+    match side.as_bytes() {
+        b"BUY" | b"Buy" | b"buy" => Some(PolkamarktOrderSide::Buy),
+        b"SELL" | b"Sell" | b"sell" => Some(PolkamarktOrderSide::Sell),
+        _ => None,
+    }
+}
+
+fn polkamarkt_order_side_label(side: PolkamarktOrderSide) -> String {
+    match side {
+        PolkamarktOrderSide::Buy => String::from("Buy"),
+        PolkamarktOrderSide::Sell => String::from("Sell"),
+    }
+}
+
+fn polkamarkt_status_label(status: &PolkamarktMarketStatus) -> String {
+    match status {
+        PolkamarktMarketStatus::Open => String::from("Open"),
+        PolkamarktMarketStatus::Locked => String::from("Locked"),
+        PolkamarktMarketStatus::Resolved => String::from("Resolved"),
+        PolkamarktMarketStatus::Cancelled => String::from("Cancelled"),
+    }
+}
+
 impl_runtime_apis! {
     impl sp_api::Core<Block> for Runtime {
         fn version() -> RuntimeVersion {
@@ -3699,6 +3743,152 @@ impl_runtime_apis! {
 
         fn list_supported_sources() -> Vec<LiquiditySourceType> {
             DEXAPI::get_supported_types()
+        }
+    }
+
+    impl polkamarkt_runtime_api::PolkamarktAPI<Block, AccountId, Balance> for Runtime {
+        fn quote_buy(
+            market_id: u32,
+            outcome: String,
+            collateral_in: Balance,
+        ) -> Option<polkamarkt_runtime_api::BuyQuote<Balance>> {
+            let outcome = polkamarkt_outcome_from_string(outcome)?;
+            let quote = Polkamarkt::quote_buy_market(market_id, outcome, collateral_in).ok()?;
+            Some(polkamarkt_runtime_api::BuyQuote {
+                market_id: quote.market_id,
+                outcome: polkamarkt_outcome_label(quote.outcome),
+                collateral_in: quote.collateral_in,
+                fee_amount: quote.fee_amount,
+                pricing_collateral: quote.pricing_collateral,
+                shares_out: quote.shares_out,
+            })
+        }
+
+        fn quote_sell(
+            market_id: u32,
+            outcome: String,
+            shares_in: Balance,
+        ) -> Option<polkamarkt_runtime_api::SellQuote<Balance>> {
+            let outcome = polkamarkt_outcome_from_string(outcome)?;
+            let quote = Polkamarkt::quote_sell_market(market_id, outcome, shares_in).ok()?;
+            Some(polkamarkt_runtime_api::SellQuote {
+                market_id: quote.market_id,
+                outcome: polkamarkt_outcome_label(quote.outcome),
+                shares_in: quote.shares_in,
+                gross_collateral_out: quote.gross_collateral_out,
+                fee_amount: quote.fee_amount,
+                collateral_out: quote.collateral_out,
+            })
+        }
+
+        fn quote_add_liquidity(
+            market_id: u32,
+            collateral_in: Balance,
+        ) -> Option<polkamarkt_runtime_api::LiquidityQuote<Balance>> {
+            let quote = Polkamarkt::quote_add_liquidity_market(market_id, collateral_in).ok()?;
+            Some(polkamarkt_runtime_api::LiquidityQuote {
+                market_id: quote.market_id,
+                collateral_in: quote.collateral_in,
+                lp_shares_out: quote.lp_shares_out,
+                pool_collateral: quote.pool_collateral,
+                total_lp_shares: quote.total_lp_shares,
+            })
+        }
+
+        fn quote_flip_position(
+            market_id: u32,
+            from_outcome: String,
+            shares_in: Balance,
+        ) -> Option<polkamarkt_runtime_api::FlipQuote<Balance>> {
+            let from_outcome = polkamarkt_outcome_from_string(from_outcome)?;
+            let quote = Polkamarkt::quote_flip_position_market(market_id, from_outcome, shares_in).ok()?;
+            Some(polkamarkt_runtime_api::FlipQuote {
+                market_id: quote.market_id,
+                from_outcome: polkamarkt_outcome_label(quote.from_outcome),
+                to_outcome: polkamarkt_outcome_label(quote.to_outcome),
+                shares_in: quote.shares_in,
+                gross_collateral_out: quote.gross_collateral_out,
+                sell_fee_amount: quote.sell_fee_amount,
+                collateral_reinvested: quote.collateral_reinvested,
+                buy_fee_amount: quote.buy_fee_amount,
+                pricing_collateral: quote.pricing_collateral,
+                shares_out: quote.shares_out,
+            })
+        }
+
+        fn quote_order(
+            market_id: u32,
+            outcome: String,
+            side: String,
+            price_cents: u8,
+            shares: Balance,
+        ) -> Option<polkamarkt_runtime_api::OrderQuote<Balance>> {
+            let outcome = polkamarkt_outcome_from_string(outcome)?;
+            let side = polkamarkt_order_side_from_string(side)?;
+            let quote = Polkamarkt::quote_order_market(market_id, outcome, side, price_cents, shares).ok()?;
+            Some(polkamarkt_runtime_api::OrderQuote {
+                market_id: quote.market_id,
+                outcome: polkamarkt_outcome_label(quote.outcome),
+                side: polkamarkt_order_side_label(quote.side),
+                price_cents: quote.price_cents,
+                shares: quote.shares,
+                filled_shares: quote.filled_shares,
+                posted_shares: quote.posted_shares,
+                collateral_in: quote.collateral_in,
+                collateral_out: quote.collateral_out,
+                fee_amount: quote.fee_amount,
+            })
+        }
+
+        fn order_book(
+            market_id: u32,
+            outcome: String,
+            depth: u32,
+        ) -> Option<polkamarkt_runtime_api::OrderBook<Balance>> {
+            let outcome = polkamarkt_outcome_from_string(outcome)?;
+            let book = Polkamarkt::order_book_depth(market_id, outcome, depth).ok()?;
+            Some(polkamarkt_runtime_api::OrderBook {
+                bids: book
+                    .bids
+                    .into_iter()
+                    .map(|level| polkamarkt_runtime_api::OrderBookLevel {
+                        price_cents: level.price_cents,
+                        shares: level.shares,
+                    })
+                    .collect(),
+                asks: book
+                    .asks
+                    .into_iter()
+                    .map(|level| polkamarkt_runtime_api::OrderBookLevel {
+                        price_cents: level.price_cents,
+                        shares: level.shares,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn claimable(
+            account_id: AccountId,
+            market_id: u32,
+        ) -> Option<polkamarkt_runtime_api::ClaimableInfo<AccountId, Balance>> {
+            let info = Polkamarkt::claimable_info(account_id, market_id).ok()?;
+            Some(polkamarkt_runtime_api::ClaimableInfo {
+                market_id: info.market_id,
+                account: info.account,
+                status: polkamarkt_status_label(&info.status),
+                resolution_outcome: info.resolution_outcome.map(polkamarkt_outcome_label),
+                yes_shares: info.yes_shares,
+                no_shares: info.no_shares,
+                net_collateral_paid: info.net_collateral_paid,
+                trader_payout: info.trader_payout,
+                claimable_payout: info.claimable_payout,
+                open_yes_shares: info.open_yes_shares,
+                open_no_shares: info.open_no_shares,
+                open_collateral: info.open_collateral,
+                creator_fees: info.creator_fees,
+                creator_liquidity: info.creator_liquidity,
+                is_creator: info.is_creator,
+            })
         }
     }
 

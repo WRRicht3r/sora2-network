@@ -91,6 +91,7 @@ order-book = { path = "../pallets/order-book", default-features = false }
 order-book-benchmarking = { path = "../pallets/order-book/benchmarking", default-features = false, optional = true }
 permissions = { path = "../pallets/permissions", default-features = false }
 pallet-polkamarkt = { package = "pallet-polkamarkt", path = "../pallets/polkamarkt", default-features = false }
+polkamarkt-runtime-api = { path = "../pallets/polkamarkt/runtime-api", default-features = false }
 pool-xyk = { path = "../pallets/pool-xyk", default-features = false }
 pool-xyk-benchmarking = { path = "../pallets/pool-xyk/benchmarking", default-features = false, optional = true }
 presto = { path = "../pallets/presto", default-features = false }
@@ -243,6 +244,7 @@ std = [
     "multisig-verifier/std",
     "bridge-types/std",
     "pallet-polkamarkt/std",
+    "polkamarkt-runtime-api/std",
     "farming/std",
     "farming-runtime-api/std",
     "faucet/std",
@@ -461,6 +463,7 @@ try-runtime = [
     "multicollateral-bonding-curve-pool/try-runtime",
     "oracle-proxy/try-runtime",
     "order-book/try-runtime",
+    "pallet-polkamarkt/try-runtime",
     "pallet-authorship/try-runtime",
     "pallet-babe/try-runtime",
     "pallet-balances/try-runtime",
