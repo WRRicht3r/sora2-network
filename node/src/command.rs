@@ -62,6 +62,74 @@ impl SubstrateCli for Cli {
         let chain_spec = match id {
             "" | "local" => Some(framenode_chain_spec::local_testnet_config(3, 3)),
             "docker-local" => Some(framenode_chain_spec::local_testnet_config(1, 1)),
+            "integration" | "integration-4" | "integration-local" => {
+                Some(framenode_chain_spec::integration_testnet_config(4))
+            }
+            "integration-5" => Some(framenode_chain_spec::integration_testnet_config(5)),
+            "integration-6" => Some(framenode_chain_spec::integration_testnet_config(6)),
+            "integration-mock-rewards" | "integration-mock-rewards-4" => {
+                Some(framenode_chain_spec::integration_mock_rewards_testnet_config(4))
+            }
+            "integration-mock-rewards-5" => {
+                Some(framenode_chain_spec::integration_mock_rewards_testnet_config(5))
+            }
+            "integration-mock-rewards-6" => {
+                Some(framenode_chain_spec::integration_mock_rewards_testnet_config(6))
+            }
+            "integration-mock-bridge" | "integration-mock-bridge-4" => {
+                Some(framenode_chain_spec::integration_mock_bridge_testnet_config(4))
+            }
+            "integration-mock-bridge-5" => {
+                Some(framenode_chain_spec::integration_mock_bridge_testnet_config(5))
+            }
+            "integration-mock-bridge-6" => {
+                Some(framenode_chain_spec::integration_mock_bridge_testnet_config(6))
+            }
+            "integration-mock-market" | "integration-mock-market-4" => {
+                Some(framenode_chain_spec::integration_mock_market_testnet_config(4))
+            }
+            "integration-mock-market-5" => {
+                Some(framenode_chain_spec::integration_mock_market_testnet_config(5))
+            }
+            "integration-mock-market-6" => {
+                Some(framenode_chain_spec::integration_mock_market_testnet_config(6))
+            }
+            "integration-mock-vesting" | "integration-mock-vesting-4" => {
+                Some(framenode_chain_spec::integration_mock_vesting_testnet_config(4))
+            }
+            "integration-mock-vesting-5" => {
+                Some(framenode_chain_spec::integration_mock_vesting_testnet_config(5))
+            }
+            "integration-mock-vesting-6" => {
+                Some(framenode_chain_spec::integration_mock_vesting_testnet_config(6))
+            }
+            "integration-mock-iroha" | "integration-mock-iroha-4" => Some(
+                framenode_chain_spec::integration_mock_iroha_testnet_config(4),
+            ),
+            "integration-mock-iroha-5" => Some(
+                framenode_chain_spec::integration_mock_iroha_testnet_config(5),
+            ),
+            "integration-mock-iroha-6" => Some(
+                framenode_chain_spec::integration_mock_iroha_testnet_config(6),
+            ),
+            "integration-mock-oracle" | "integration-mock-oracle-4" => {
+                Some(framenode_chain_spec::integration_mock_oracle_testnet_config(4))
+            }
+            "integration-mock-oracle-5" => {
+                Some(framenode_chain_spec::integration_mock_oracle_testnet_config(5))
+            }
+            "integration-mock-oracle-6" => {
+                Some(framenode_chain_spec::integration_mock_oracle_testnet_config(6))
+            }
+            "integration-mock-adversarial" | "integration-mock-adversarial-4" => {
+                Some(framenode_chain_spec::integration_mock_adversarial_testnet_config(4))
+            }
+            "integration-mock-adversarial-5" => {
+                Some(framenode_chain_spec::integration_mock_adversarial_testnet_config(5))
+            }
+            "integration-mock-adversarial-6" => {
+                Some(framenode_chain_spec::integration_mock_adversarial_testnet_config(6))
+            }
             // dev doesn't use json chain spec to make development easier
             // "dev" => framenode_chain_spec::dev_net(),
             // "dev-coded" => Ok(framenode_chain_spec::dev_net_coded()),
@@ -114,6 +182,39 @@ mod tests {
             .expect("local chainspec should load with embedded wasm");
         <Cli as SubstrateCli>::load_spec(&cli, "dev")
             .expect("dev chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration")
+            .expect("integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-6")
+            .expect("six peer integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-rewards")
+            .expect("mock rewards integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-bridge")
+            .expect("mock bridge integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-market")
+            .expect("mock market integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-vesting")
+            .expect("mock vesting integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-iroha")
+            .expect("mock iroha integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-oracle")
+            .expect("mock oracle integration chainspec should load with embedded wasm");
+        <Cli as SubstrateCli>::load_spec(&cli, "integration-mock-adversarial")
+            .expect("mock adversarial integration chainspec should load with embedded wasm");
+    }
+}
+
+#[cfg(all(test, not(feature = "private-net")))]
+mod default_chain_spec_tests {
+    use super::Cli;
+    use clap::Parser;
+    use sc_cli::SubstrateCli;
+
+    #[test]
+    fn main_chain_spec_loads_with_default_node_features() {
+        let cli = Cli::parse_from(["framenode"]);
+
+        <Cli as SubstrateCli>::load_spec(&cli, "main")
+            .expect("main chainspec should load with embedded json");
     }
 }
 
@@ -271,13 +372,38 @@ pub fn run() -> sc_cli::Result<()> {
             set_default_ss58_version();
             runner.run_node_until_exit(|config| async move {
                 #[cfg(feature = "wip")] // Bridges
-                return service::new_full(config, cli.disable_beefy, None)
-                    .map_err(sc_cli::Error::Service);
+                return match config.network.network_backend {
+                    sc_network::config::NetworkBackendType::Libp2p => {
+                        service::new_full::<sc_network::NetworkWorker<_, _>>(
+                            config,
+                            cli.disable_beefy,
+                            None,
+                        )
+                        .map_err(sc_cli::Error::Service)
+                    }
+                    sc_network::config::NetworkBackendType::Litep2p => {
+                        service::new_full::<sc_network::Litep2pNetworkBackend>(
+                            config,
+                            cli.disable_beefy,
+                            None,
+                        )
+                        .map_err(sc_cli::Error::Service)
+                    }
+                };
                 // Disable BEEFY on production.
                 // BEEFY is still work in progress and probably will contain breaking changes, so it's better to enable it when it's ready
                 // Also before enabling it we need to ensure that validators updated their session keys
                 #[cfg(not(feature = "wip"))] // Bridges
-                service::new_full(config, true, None).map_err(sc_cli::Error::Service)
+                match config.network.network_backend {
+                    sc_network::config::NetworkBackendType::Libp2p => {
+                        service::new_full::<sc_network::NetworkWorker<_, _>>(config, true, None)
+                            .map_err(sc_cli::Error::Service)
+                    }
+                    sc_network::config::NetworkBackendType::Litep2p => {
+                        service::new_full::<sc_network::Litep2pNetworkBackend>(config, true, None)
+                            .map_err(sc_cli::Error::Service)
+                    }
+                }
             })
         }
     }

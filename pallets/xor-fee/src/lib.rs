@@ -51,7 +51,7 @@ use frame_support::traits::{Currency, ExistenceRequirement, Get, Imbalance, With
 use frame_support::unsigned::TransactionValidityError;
 use frame_support::weights::Weight;
 use frame_support::weights::{
-    WeightToFeeCoefficient, WeightToFeeCoefficients, WeightToFeePolynomial,
+    WeightToFee, WeightToFeeCoefficient, WeightToFeeCoefficients, WeightToFeePolynomial,
 };
 use pallet_transaction_payment as ptp;
 use pallet_transaction_payment::{
@@ -65,6 +65,7 @@ use sp_runtime::traits::{
     Saturating, UniqueSaturatedInto, Zero,
 };
 use sp_runtime::{DispatchError, DispatchResult, FixedPointNumber, FixedU128, Perbill, Percent};
+use sp_staking::{EraIndex, Page};
 use sp_std::boxed::Box;
 use sp_std::marker::PhantomData;
 #[cfg(feature = "wip")] // Xorless fee
@@ -386,20 +387,13 @@ where
                         return Ok(());
                     }
 
-                    // Applying VAL buy-back-and-burn logic
+                    // Applying VAL buy-back-and-burn logic.
                     let (referrer_xor, adjusted_paid) = adjusted_paid.ration(
                         T::FeeReferrerWeight::get(),
-                        T::FeeXorBurnedWeight::get()
-                            + T::FeeValBurnedWeight::get()
-                            + T::FeeKusdBurnedWeight::get(),
+                        T::FeeXorBurnedWeight::get() + T::FeeValBurnedWeight::get(),
                     );
-                    let (xor_to_val, adjusted_paid) = adjusted_paid.ration(
-                        T::FeeValBurnedWeight::get(),
-                        T::FeeXorBurnedWeight::get() + T::FeeKusdBurnedWeight::get(),
-                    );
-                    let (xor_to_buy_back, _xor_burned) = adjusted_paid
-                        .ration(T::FeeKusdBurnedWeight::get(), T::FeeXorBurnedWeight::get());
-                    let mut xor_to_buy_back = xor_to_buy_back.peek();
+                    let (xor_to_val, _xor_burned) = adjusted_paid
+                        .ration(T::FeeValBurnedWeight::get(), T::FeeXorBurnedWeight::get());
 
                     if let Some(referrer) = T::ReferrerAccountProvider::get_referrer_account(who) {
                         let referrer_portion = referrer_xor.peek();
@@ -409,18 +403,11 @@ where
                             referrer,
                             referrer_portion.into(),
                         ));
-                    } else {
-                        // Use XOR to BBB if there's no referrer
-                        xor_to_buy_back = xor_to_buy_back.saturating_add(referrer_xor.peek());
                     }
 
                     let xor_to_val: Balance = xor_to_val.peek().unique_saturated_into();
-                    let xor_to_buy_back: Balance = xor_to_buy_back.unique_saturated_into();
                     XorToVal::<T>::mutate(|balance| {
                         *balance = balance.saturating_add(xor_to_val);
-                    });
-                    XorToBuyBack::<T>::mutate(|balance| {
-                        *balance = balance.saturating_add(xor_to_buy_back);
                     });
                 }
             } else {
@@ -460,17 +447,10 @@ where
                 // Applying VAL buy-back-and-burn logic
                 let (referrer_xor, adjusted_paid) = adjusted_paid.ration(
                     T::FeeReferrerWeight::get(),
-                    T::FeeXorBurnedWeight::get()
-                        + T::FeeValBurnedWeight::get()
-                        + T::FeeKusdBurnedWeight::get(),
+                    T::FeeXorBurnedWeight::get() + T::FeeValBurnedWeight::get(),
                 );
-                let (xor_to_val, adjusted_paid) = adjusted_paid.ration(
-                    T::FeeValBurnedWeight::get(),
-                    T::FeeXorBurnedWeight::get() + T::FeeKusdBurnedWeight::get(),
-                );
-                let (xor_to_buy_back, _xor_burned) = adjusted_paid
-                    .ration(T::FeeKusdBurnedWeight::get(), T::FeeXorBurnedWeight::get());
-                let mut xor_to_buy_back = xor_to_buy_back.peek();
+                let (xor_to_val, _xor_burned) = adjusted_paid
+                    .ration(T::FeeValBurnedWeight::get(), T::FeeXorBurnedWeight::get());
 
                 if let Some(referrer) = T::ReferrerAccountProvider::get_referrer_account(who) {
                     let referrer_portion = referrer_xor.peek();
@@ -488,18 +468,11 @@ where
                         referrer,
                         referrer_portion.into(),
                     ));
-                } else {
-                    // Use XOR to BBB if there's no referrer
-                    xor_to_buy_back = xor_to_buy_back.saturating_add(referrer_xor.peek());
                 }
 
                 let xor_to_val: Balance = xor_to_val.peek().unique_saturated_into();
-                let xor_to_buy_back: Balance = xor_to_buy_back.unique_saturated_into();
                 XorToVal::<T>::mutate(|balance| {
                     *balance = balance.saturating_add(xor_to_val);
-                });
-                XorToBuyBack::<T>::mutate(|balance| {
-                    *balance = balance.saturating_add(xor_to_buy_back);
                 });
             }
         }
@@ -545,6 +518,20 @@ impl<T: Config> OnDenominate<common::BalanceOf<T>> for DenominateXor<T> {
 
 pub type CustomFeeDetailsOf<T> =
     <<T as Config>::CustomFees as ApplyCustomFees<CallOf<T>, AccountIdOf<T>>>::FeeDetails;
+
+pub trait StakingValPayout<Call, AccountId> {
+    type Pre;
+
+    fn pre_dispatch(_call: &Call) -> Option<Self::Pre> {
+        None
+    }
+
+    fn post_dispatch(_pre: Option<Self::Pre>, _result: &DispatchResult) {}
+}
+
+impl<Call, AccountId> StakingValPayout<Call, AccountId> for () {
+    type Pre = ();
+}
 
 /// Trait whose implementation allows to redefine extrinsics fees based
 /// on the extrinsic's `Call` variant and dispatch result
@@ -704,13 +691,18 @@ where
         let multiplier = Multiplier::<T>::get();
         fee.inclusion_fee = fee.inclusion_fee.map(|fee| InclusionFee {
             base_fee: multiplier.saturating_mul_int(fee.base_fee),
-            len_fee: multiplier.saturating_mul_int(fee.len_fee),
+            len_fee: fee.len_fee,
             adjusted_weight_fee: multiplier.saturating_mul_int(fee.adjusted_weight_fee),
         });
         fee.tip = multiplier.saturating_mul_int(fee.tip);
 
         fee
     }
+
+    fn length_fee(len: u32) -> BalanceOf<T> {
+        <T as ptp::Config>::LengthToFee::weight_to_fee(&Weight::from_parts(len as u64, 0))
+    }
+
     pub fn compute_fee_details(
         len: u32,
         call: &CallOf<T>,
@@ -739,7 +731,7 @@ where
                 FeeDetails {
                     inclusion_fee: Some(InclusionFee {
                         base_fee: 0_u32.into(),
-                        len_fee: 0_u32.into(),
+                        len_fee: Self::length_fee(len),
                         adjusted_weight_fee: BalanceOf::<T>::saturated_from(custom_fee),
                     }),
                     tip,
@@ -801,7 +793,7 @@ where
             Some(custom_fee) => FeeDetails {
                 inclusion_fee: Some(InclusionFee {
                     base_fee: 0_u32.into(),
-                    len_fee: 0_u32.into(),
+                    len_fee: Self::length_fee(len),
                     adjusted_weight_fee: BalanceOf::<T>::saturated_from(custom_fee),
                 }),
                 tip,
@@ -851,6 +843,37 @@ where
 }
 
 impl<T: Config> Pallet<T> {
+    pub fn record_val_staking_reward(era: Option<EraIndex>, amount: Balance) {
+        if amount.is_zero() {
+            return;
+        }
+
+        if let Some(era) = era {
+            let pending = UnassignedValStakingReward::<T>::take();
+            let amount = amount.saturating_add(pending);
+            ValStakingEraReward::<T>::mutate(era, |balance| {
+                *balance = balance.saturating_add(amount);
+            });
+            Self::deposit_event(Event::<T>::ValStakingRewardRecorded(era, amount));
+        } else {
+            UnassignedValStakingReward::<T>::mutate(|balance| {
+                *balance = balance.saturating_add(amount);
+            });
+        }
+    }
+
+    pub fn deposit_val_staking_reward_paid(
+        stash: T::AccountId,
+        dest: T::AccountId,
+        era: EraIndex,
+        page: Page,
+        amount: Balance,
+    ) {
+        Self::deposit_event(Event::<T>::ValStakingRewardPaid(
+            stash, dest, era, page, amount,
+        ));
+    }
+
     pub fn random_remint() -> Weight {
         let mut weight = Weight::default();
         weight.saturating_accrue(T::DbWeight::get().reads(3));
@@ -861,7 +884,10 @@ impl<T: Config> Pallet<T> {
                 if random_number % period == 0 {
                     weight.saturating_accrue(T::DbWeight::get().reads(2));
                     let mut xor_to_val = Balance::zero();
+                    #[cfg(feature = "wip")]
                     let mut xor_to_buy_back = Balance::zero();
+                    #[cfg(not(feature = "wip"))]
+                    let xor_to_buy_back = Balance::zero();
 
                     #[cfg(feature = "wip")] // Xorless fee
                     Self::remint_fee_asset(&mut weight, &mut xor_to_val, &mut xor_to_buy_back);
@@ -873,13 +899,8 @@ impl<T: Config> Pallet<T> {
                         }
                     }
 
-                    xor_to_buy_back = xor_to_buy_back.saturating_add(XorToBuyBack::<T>::take());
-
-                    if xor_to_buy_back != 0 {
-                        if let Err(e) = Self::remint_buy_back(&mut weight, xor_to_buy_back) {
-                            error!("XOR remint buy back failed: {e:?}");
-                        }
-                    }
+                    let _ = xor_to_buy_back;
+                    let _ = XorToBuyBack::<T>::take();
                 }
             }
             Err(error) => {
@@ -893,23 +914,17 @@ impl<T: Config> Pallet<T> {
         let tech_account_id = <T as Config>::GetTechnicalAccountId::get();
         let xor = T::XorId::get();
         let val = T::ValId::get();
-        let kusd = T::KusdId::get();
-        let xor_to_burn_for_tbcd = T::RemintTbcdBuyBackPercent::get() * xor_to_val;
+        let xor_to_burn = T::RemintXorBurnPercent::get() * xor_to_val;
 
         // Re-minting the `xor_to_val` tokens amount to `tech_account_id` of this pallet.
         // The tokens being re-minted had initially been withdrawn as a part of the fee.
         weight.saturating_accrue(T::DbWeight::get().reads_writes(2, 1));
         T::AssetManager::mint_to(&xor, &tech_account_id, &tech_account_id, xor_to_val)?;
-        if !xor_to_burn_for_tbcd.is_zero() {
+        if !xor_to_burn.is_zero() {
             weight.saturating_accrue(T::DbWeight::get().reads_writes(2, 1));
-            T::AssetManager::burn_from(
-                &xor,
-                &tech_account_id,
-                &tech_account_id,
-                xor_to_burn_for_tbcd,
-            )?;
+            T::AssetManager::burn_from(&xor, &tech_account_id, &tech_account_id, xor_to_burn)?;
         }
-        let xor_to_val = xor_to_val.saturating_sub(xor_to_burn_for_tbcd);
+        let xor_to_val = xor_to_val.saturating_sub(xor_to_burn);
         if xor_to_val.is_zero() {
             return Ok(());
         }
@@ -932,26 +947,7 @@ impl<T: Config> Pallet<T> {
             ),
         ) {
             Ok(swap_outcome) => {
-                let mut val_to_burn = swap_outcome.amount;
-                let kusd_buy_back = T::RemintKusdBuyBackPercent::get() * val_to_burn;
-
-                if let Err(e) = common::with_transaction(|| {
-                    weight.saturating_accrue(
-                        T::DbWeight::get()
-                            .reads_writes(2, 1)
-                            .saturating_add(T::PoolXyk::exchange_weight()),
-                    );
-                    T::BuyBackHandler::buy_back_and_burn(
-                        &tech_account_id,
-                        &val,
-                        &kusd,
-                        kusd_buy_back,
-                    )
-                }) {
-                    frame_support::__private::log::error!("Failed to buy back KUSD: {e:?}");
-                } else {
-                    val_to_burn = val_to_burn.saturating_sub(kusd_buy_back);
-                }
+                let val_to_burn = swap_outcome.amount;
 
                 weight.saturating_accrue(T::DbWeight::get().reads_writes(1, 1));
                 T::OnValBurned::on_val_burned(val_to_burn);
@@ -990,7 +986,7 @@ impl<T: Config> Pallet<T> {
     pub fn remint_fee_asset(
         weight: &mut Weight,
         xor_to_val: &mut Balance,
-        xor_to_buy_back: &mut Balance,
+        _xor_to_buy_back: &mut Balance,
     ) {
         BurntForFee::<T>::iter().for_each(|(asset_id, asset_fee)| {
             weight.saturating_accrue(T::DbWeight::get().reads(1));
@@ -1005,12 +1001,7 @@ impl<T: Config> Pallet<T> {
                                 T::FeeValBurnedWeight::get(),
                                 burnt_xor,
                             ));
-                        *xor_to_buy_back = xor_to_buy_back.saturating_add(
-                            Self::calculate_portion_fee_from_weight(
-                                T::FeeKusdBurnedWeight::get() + additional_weight,
-                                burnt_xor,
-                            ),
-                        );
+                        let _ = additional_weight;
                         Ok(())
                     }
                     Err(e) => {
@@ -1020,7 +1011,7 @@ impl<T: Config> Pallet<T> {
                 }
             };
 
-            // referral part going to the xor to buy back
+            // Process both fee buckets; the referrer bucket is burned as XOR when no referrer is paid.
             match (
                 process_fee(asset_fee.fee, u32::zero()),
                 process_fee(asset_fee.fee_without_referral, T::FeeReferrerWeight::get()),
@@ -1152,16 +1143,19 @@ pub mod pallet {
         type XorId: Get<AssetIdOf<Self>>;
         type ValId: Get<AssetIdOf<Self>>;
         type KusdId: Get<AssetIdOf<Self>>;
-        type TbcdId: Get<AssetIdOf<Self>>;
         type FeeReferrerWeight: Get<u32>;
         type FeeXorBurnedWeight: Get<u32>;
         type FeeValBurnedWeight: Get<u32>;
         type FeeKusdBurnedWeight: Get<u32>;
-        type RemintTbcdBuyBackPercent: Get<Percent>;
+        type RemintXorBurnPercent: Get<Percent>;
         type RemintKusdBuyBackPercent: Get<Percent>;
         type DEXIdValue: Get<Self::DEXId>;
         type LiquidityProxy: LiquidityProxyTrait<Self::DEXId, Self::AccountId, AssetIdOf<Self>>;
         type OnValBurned: OnValBurned;
+        type StakingValPayout: StakingValPayout<
+            <Self as frame_system::Config>::RuntimeCall,
+            Self::AccountId,
+        >;
         type CustomFees: ApplyCustomFees<CallOf<Self>, Self::AccountId>;
         type GetTechnicalAccountId: Get<Self::AccountId>;
         type FullIdentification;
@@ -1190,10 +1184,7 @@ pub mod pallet {
     }
 
     /// The current storage version.
-    #[cfg(feature = "wip")]
-    const STORAGE_VERSION: StorageVersion = StorageVersion::new(2);
-    #[cfg(not(feature = "wip"))]
-    const STORAGE_VERSION: StorageVersion = StorageVersion::new(1);
+    const STORAGE_VERSION: StorageVersion = StorageVersion::new(3);
 
     #[pallet::pallet]
     #[pallet::storage_version(STORAGE_VERSION)]
@@ -1429,6 +1420,10 @@ pub mod pallet {
         #[cfg(not(feature = "wip"))] // Xorless fee
         /// The portion of fee is sent to the referrer. [Referral, Referrer, Amount]
         ReferrerRewarded(AccountIdOf<T>, AccountIdOf<T>, Balance),
+        /// VAL staking reward was assigned to an era. [Era, Amount]
+        ValStakingRewardRecorded(EraIndex, Balance),
+        /// VAL staking reward was paid. [Stash, Destination, Era, Page, Amount]
+        ValStakingRewardPaid(AccountIdOf<T>, AccountIdOf<T>, EraIndex, Page, Balance),
         /// New multiplier for weight to fee conversion is set
         /// (*1_000_000_000_000_000_000). [New value]
         WeightToFeeMultiplierUpdated(FixedU128),
@@ -1496,10 +1491,21 @@ pub mod pallet {
     #[pallet::getter(fn xor_to_val)]
     pub type XorToVal<T: Config> = StorageValue<_, Balance, ValueQuery>;
 
-    /// The amount of XOR to be reminted and exchanged for KUSD at the end of the session
+    /// Legacy XOR buyback bucket. Cleared by the v3 migration and ignored by reminting.
     #[pallet::storage]
     #[pallet::getter(fn xor_to_kusd)]
     pub type XorToBuyBack<T: Config> = StorageValue<_, Balance, ValueQuery>;
+
+    /// Bought-back VAL reward amount available for staking payouts by era.
+    #[pallet::storage]
+    #[pallet::getter(fn val_staking_era_reward)]
+    pub type ValStakingEraReward<T: Config> =
+        StorageMap<_, Twox64Concat, EraIndex, Balance, ValueQuery>;
+
+    /// Bought-back VAL reward amount collected before staking has an active era.
+    #[pallet::storage]
+    #[pallet::getter(fn unassigned_val_staking_reward)]
+    pub type UnassignedValStakingReward<T: Config> = StorageValue<_, Balance, ValueQuery>;
 
     #[pallet::type_value]
     pub fn DefaultForFeeMultiplier<T: Config>() -> FixedU128 {
@@ -1521,8 +1527,8 @@ pub mod pallet {
     #[pallet::getter(fn remint_period)]
     pub type RemintPeriod<T> = StorageValue<_, u32, ValueQuery, DefaultForRemintPeriod<T>>;
 
-    // This affects `base_fee` and `weight_fee`. `length_fee` is too small
-    // in comparison to them, so we should be fine multiplying only this parts.
+    // This affects `base_fee` and `weight_fee`; `length_fee` is charged per byte
+    // via `LengthToFee` and is not scaled by the multiplier.
     impl<T: Config> WeightToFeePolynomial for Pallet<T> {
         type Balance = Balance;
 

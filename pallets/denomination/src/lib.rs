@@ -35,16 +35,13 @@ use codec::{Decode, DecodeWithMemTracking, Encode};
 use codec::{FullCodec, MaxEncodedLen};
 use frame_support::__private::log;
 use frame_support::{dispatch::DispatchResult, weights::Weight};
-use frame_support::{
-    CloneNoBound, EqNoBound, PartialEqNoBound, RuntimeDebugNoBound, StoragePrefixedMap,
-};
+use frame_support::{CloneNoBound, DebugNoBound, EqNoBound, PartialEqNoBound, StoragePrefixedMap};
 use frame_system::pallet_prelude::BlockNumberFor;
 use scale_info::TypeInfo;
 use sp_core::bounded::BoundedVec;
 use sp_runtime::traits::CheckedMul;
 use sp_runtime::traits::{Convert, ConvertBack, One, Saturating, Zero};
 use sp_runtime::Perbill;
-use sp_runtime::RuntimeDebug;
 use sp_staking::EraIndex;
 use sp_std::prelude::*;
 
@@ -73,7 +70,7 @@ pub enum MigrationStage {
 
 /// A pending slash record. The value of the slash has been computed but not applied yet,
 /// rather deferred for several eras.
-#[derive(Encode, Decode, RuntimeDebug, TypeInfo)]
+#[derive(Encode, Decode, Debug, TypeInfo)]
 pub struct UnappliedSlash<AccountId, Balance: HasCompact> {
     /// The stash ID of the offending validator.
     validator: AccountId,
@@ -95,7 +92,7 @@ pub struct SpanRecord<Balance> {
 }
 
 /// Just a Balance/BlockNumber tuple to encode when a chunk of funds will be unlocked.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Debug, TypeInfo, MaxEncodedLen)]
 pub struct UnlockChunk<Balance: HasCompact + MaxEncodedLen> {
     /// Amount of funds to be unlocked.
     #[codec(compact)]
@@ -107,14 +104,7 @@ pub struct UnlockChunk<Balance: HasCompact + MaxEncodedLen> {
 
 /// The ledger of a (bonded) stash.
 #[derive(
-    PartialEqNoBound,
-    EqNoBound,
-    CloneNoBound,
-    Encode,
-    Decode,
-    RuntimeDebugNoBound,
-    TypeInfo,
-    MaxEncodedLen,
+    PartialEqNoBound, EqNoBound, CloneNoBound, Encode, Decode, DebugNoBound, TypeInfo, MaxEncodedLen,
 )]
 #[scale_info(skip_type_params(T))]
 pub struct StakingLedger<T: Config> {
@@ -145,7 +135,7 @@ pub trait ShouldRemoveAccount<AccountData> {
 pub mod pallet {
     use super::*;
     use common::OnDenominate;
-    use frame_support::{pallet_prelude::*, traits::Currency};
+    use frame_support::{pallet_prelude::*, traits::Currency, transactional};
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{ConvertBack, One};
 
@@ -398,6 +388,7 @@ pub mod pallet {
 
         #[pallet::call_index(1)]
         #[pallet::weight(common::weights::constants::EXTRINSIC_FIXED_WEIGHT)]
+        #[transactional]
         pub fn start_denomination(
             origin: OriginFor<T>,
             denominator: BalanceOf<T>,
@@ -407,9 +398,11 @@ pub mod pallet {
                 CurrentMigrationStage::<T>::get() == MigrationStage::Denomination,
                 Error::<T>::WrongMigrationStage
             );
+            ensure!(!denominator.is_zero(), Error::<T>::InvalidDenominator);
             let new_denominator = Denominator::<T>::get()
                 .checked_mul(&denominator)
                 .ok_or(Error::<T>::InvalidDenominator)?;
+            ensure!(!new_denominator.is_zero(), Error::<T>::InvalidDenominator);
             Self::denominate(denominator)?;
             T::OnDenominate::on_denominate(&denominator)?;
             CurrentMigrationStage::<T>::set(MigrationStage::Complete);

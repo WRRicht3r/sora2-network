@@ -52,7 +52,7 @@ use common::eth;
 use ethabi::ParamType;
 use ethereum_types::U256;
 use frame_support::sp_runtime::app_crypto::{ecdsa, sp_core};
-use frame_support::sp_runtime::offchain::storage::StorageValueRef;
+use frame_support::sp_runtime::offchain::storage::{StorageRetrievalError, StorageValueRef};
 use frame_support::sp_runtime::traits::IdentifyAccount;
 use frame_support::sp_runtime::MultiSigner;
 use frame_support::traits::Get;
@@ -68,7 +68,6 @@ use rustc_hex::ToHex;
 use serde::{Deserialize, Serialize};
 use sp_core::crypto::ByteArray;
 use sp_core::{H160, H256};
-use sp_runtime::RuntimeDebug;
 use sp_std::collections::btree_set::BTreeSet;
 use sp_std::fmt;
 use sp_std::fmt::Formatter;
@@ -77,6 +76,33 @@ pub use transaction::*;
 mod handle;
 mod http;
 mod transaction;
+
+pub(crate) fn get_storage_value_or_clear<T: Decode>(
+    storage: &mut StorageValueRef<'_>,
+    description: &str,
+) -> Option<T> {
+    match storage.get::<T>() {
+        Ok(value) => value,
+        Err(StorageRetrievalError::Undecodable) => {
+            frame_support::__private::log::error!(
+                "Failed to decode {} offchain value. Clearing stale entry.",
+                description
+            );
+            storage.clear();
+            None
+        }
+    }
+}
+
+pub(crate) fn set_offchain_metric_u64(key: &[u8], value: u64) {
+    StorageValueRef::persistent(key).set(&value);
+}
+
+pub(crate) fn increment_offchain_metric_u64(key: &[u8]) {
+    let storage = StorageValueRef::persistent(key);
+    let current = storage.get::<u64>().ok().flatten().unwrap_or_default();
+    storage.set(&current.saturating_add(1));
+}
 
 /// Cryptography used by off-chain workers.
 pub mod crypto {
@@ -128,6 +154,45 @@ impl<T: Config> Pallet<T> {
         })
     }
 
+    pub(crate) fn parse_deposit_event_from_known_contract(
+        network_id: T::NetworkId,
+        log: &Log,
+    ) -> Result<
+        DepositEvent<EthAddress, <T as frame_system::pallet::Config>::AccountId, U256>,
+        Error<T>,
+    > {
+        let event = Self::parse_deposit_event(log)?;
+        Self::validate_deposit_event_source(network_id, H160(log.address.0), &event)?;
+        Ok(event)
+    }
+
+    fn validate_deposit_event_source(
+        network_id: T::NetworkId,
+        contract_address: EthAddress,
+        event: &DepositEvent<EthAddress, <T as frame_system::pallet::Config>::AccountId, U256>,
+    ) -> Result<(), Error<T>> {
+        if network_id != T::GetEthNetworkId::get()
+            || contract_address != Self::val_master_contract_address()
+        {
+            return Ok(());
+        }
+
+        ensure!(
+            event.sidechain_asset == H256::zero(),
+            Error::<T>::UnsupportedAssetId
+        );
+        let Some((asset_id, _)) =
+            Self::get_asset_by_raw_asset_id(event.sidechain_asset, &event.token, network_id)?
+        else {
+            fail!(Error::<T>::UnsupportedAssetId);
+        };
+        ensure!(
+            asset_id == common::VAL.into(),
+            Error::<T>::UnsupportedAssetId
+        );
+        Ok(())
+    }
+
     /// Loops through the given array of logs and finds the first one that matches the type
     /// and topic.
     pub fn parse_main_event(
@@ -150,14 +215,18 @@ impl<T: Config> Pallet<T> {
                 Some(x) => &x.0,
                 None => continue,
             };
+            let is_val_master_log = network_id == T::GetEthNetworkId::get()
+                && log.address.0 == Self::val_master_contract_address().0;
             match *topic {
                 topic
                     if topic == DEPOSIT_TOPIC.0
                         && (kind == IncomingTransactionRequestKind::Transfer
                             || kind == IncomingTransactionRequestKind::TransferXOR) =>
                 {
-                    return Ok(ContractEvent::Deposit(Self::parse_deposit_event(log)?));
+                    let event = Self::parse_deposit_event_from_known_contract(network_id, log)?;
+                    return Ok(ContractEvent::Deposit(event));
                 }
+                _ if is_val_master_log => continue,
                 // ChangePeers(address,bool)
                 topic
                     if topic
@@ -314,6 +383,10 @@ impl<T: Config> Pallet<T> {
         token_address: &EthAddress,
         network_id: T::NetworkId,
     ) -> Result<Option<(T::AssetId, AssetKind)>, Error<T>> {
+        ensure!(
+            !Self::is_deprecated_sidechain_token(network_id, token_address),
+            Error::<T>::DeprecatedLegacyXor
+        );
         let is_sidechain_token = raw_asset_id == H256::zero();
         if is_sidechain_token {
             let asset_id = match Self::registered_sidechain_asset(network_id, &token_address) {
@@ -322,6 +395,12 @@ impl<T: Config> Pallet<T> {
                     return Ok(None);
                 }
             };
+            ensure!(
+                network_id != T::GetEthNetworkId::get()
+                    || !Self::is_legacy_ethereum_xor_asset(&asset_id)
+                    || !crate::migration::is_legacy_ethereum_xor_decommissioned::<T>(),
+                Error::<T>::DeprecatedLegacyXor
+            );
             Ok(Some((
                 asset_id,
                 Self::registered_asset(network_id, &asset_id).unwrap_or(AssetKind::Sidechain),
@@ -397,9 +476,6 @@ impl<T: Config> Pallet<T> {
                 _,
             ) => {
                 let contract = match tx.to {
-                    Some(x) if x.0 == Self::xor_master_contract_address().0 => {
-                        ChangePeersContract::XOR
-                    }
                     Some(x) if x.0 == Self::val_master_contract_address().0 => {
                         ChangePeersContract::VAL
                     }
@@ -462,7 +538,6 @@ impl<T: Config> Pallet<T> {
         if network_id == T::GetEthNetworkId::get() {
             ensure!(
                 to == BridgeContractAddress::<T>::get(network_id)
-                    || to == Self::xor_master_contract_address()
                     || to == Self::val_master_contract_address(),
                 Error::<T>::UnknownContractAddress
             );
@@ -510,7 +585,7 @@ impl<T: Config> Pallet<T> {
     Clone,
     PartialOrd,
     Ord,
-    RuntimeDebug,
+    Debug,
     scale_info::TypeInfo,
 )]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]

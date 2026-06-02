@@ -45,7 +45,6 @@ use codec::{Decode, Encode};
 use common::prelude::Balance;
 #[cfg(feature = "std")]
 use common::utils::string_serialization;
-use common::Denominator;
 use common::{AssetInfoProvider, AssetName, AssetSymbol, IsValid, VAL};
 use ethabi::{FixedBytes, Token};
 use frame_support::sp_runtime::app_crypto::sp_core;
@@ -60,7 +59,6 @@ use frame_system::RawOrigin;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 use sp_core::{H256, U256};
-use sp_runtime::RuntimeDebug;
 use sp_std::convert::TryInto;
 use sp_std::prelude::*;
 
@@ -73,7 +71,7 @@ fn encode_network_id<T: Config>(network_id: BridgeNetworkId<T>) -> Result<H256, 
 }
 
 /// Outgoing request for transferring the given asset from Thischain to Sidechain.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingTransfer<T: Config> {
@@ -105,7 +103,8 @@ impl<T: Config> OutgoingTransfer<T> {
         let to = self.to;
         let currency_id;
         let amount;
-        let denomination_factor = T::Denominator::current_factor(&self.asset_id);
+        let denomination_factor =
+            Pallet::<T>::bridge_denomination_factor(self.network_id, &self.asset_id);
         if let Some(token_address) =
             Pallet::<T>::registered_sidechain_token(self.network_id, &self.asset_id)
         {
@@ -194,6 +193,24 @@ impl<T: Config> OutgoingTransfer<T> {
 
     /// Checks that the given asset can be transferred through the bridge.
     pub fn validate(&self) -> Result<(), DispatchError> {
+        ensure!(
+            !crate::Pallet::<T>::is_decommissioned_legacy_ethereum_xor_asset(
+                self.network_id,
+                &self.asset_id
+            ),
+            Error::<T>::DeprecatedLegacyXor
+        );
+        ensure!(
+            !crate::Pallet::<T>::is_deprecated_sidechain_token_mapping(
+                self.network_id,
+                &self.asset_id
+            ),
+            Error::<T>::DeprecatedLegacyXor
+        );
+        ensure!(
+            !crate::Pallet::<T>::is_legacy_ethereum_xor_mapping(self.network_id, &self.asset_id),
+            Error::<T>::DeprecatedLegacyXor
+        );
         if let Some(kind) = crate::RegisteredAsset::<T>::get(self.network_id, &self.asset_id) {
             if !kind.is_owned() {
                 let dust = self.sidechain_amount().map(|x| x.1)?;
@@ -300,7 +317,7 @@ impl<T: Config> OutgoingTransfer<T> {
 }
 
 /// Thischain or Sidechain asset id.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub enum CurrencyIdEncoded {
     AssetId(H256),
@@ -317,7 +334,7 @@ impl CurrencyIdEncoded {
 }
 
 /// Sidechain-compatible version of `OutgoingTransfer`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingTransferEncoded {
     pub currency_id: CurrencyIdEncoded,
@@ -349,7 +366,7 @@ impl OutgoingTransferEncoded {
 }
 
 /// Outgoing request for adding a Thischain asset.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingAddAsset<T: Config> {
@@ -423,10 +440,28 @@ impl<T: Config> OutgoingAddAsset<T> {
     /// Checks that the asset isn't registered yet.
     pub fn validate(&self) -> Result<(), DispatchError> {
         Assets::<T>::ensure_asset_exists(&self.asset_id)?;
+        let registered_asset = crate::RegisteredAsset::<T>::get(self.network_id, &self.asset_id);
         ensure!(
-            crate::RegisteredAsset::<T>::get(self.network_id, &self.asset_id).is_none(),
-            Error::<T>::TokenIsAlreadyAdded
+            !crate::Pallet::<T>::is_legacy_ethereum_xor_mapping(self.network_id, &self.asset_id),
+            Error::<T>::DeprecatedLegacyXor
         );
+        if self.network_id == T::GetEthNetworkId::get()
+            && crate::Pallet::<T>::is_legacy_ethereum_xor_asset(&self.asset_id)
+            && registered_asset.is_none()
+        {
+            ensure!(
+                !crate::RegisteredSidechainToken::<T>::contains_key(
+                    self.network_id,
+                    &self.asset_id
+                ),
+                Error::<T>::DeprecatedLegacyXor
+            );
+            ensure!(
+                crate::migration::is_legacy_ethereum_xor_decommissioned::<T>(),
+                Error::<T>::DeprecatedLegacyXor
+            );
+        }
+        ensure!(registered_asset.is_none(), Error::<T>::TokenIsAlreadyAdded);
         Ok(())
     }
 
@@ -447,7 +482,7 @@ impl<T: Config> OutgoingAddAsset<T> {
 }
 
 /// Sidechain-compatible version of `OutgoingAddAsset`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingAddAssetEncoded {
     pub symbol: String,
@@ -477,7 +512,7 @@ impl OutgoingAddAssetEncoded {
 }
 
 /// Outgoing request for adding a Sidechain token.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingAddToken<T: Config> {
@@ -592,6 +627,13 @@ impl<T: Config> OutgoingAddToken<T> {
     /// Checks that the asset isn't registered yet and the given symbol is valid.
     pub fn validate(&self) -> Result<(AssetSymbol, AssetName), DispatchError> {
         ensure!(
+            !crate::Pallet::<T>::is_deprecated_sidechain_token(
+                self.network_id,
+                &self.token_address
+            ),
+            Error::<T>::DeprecatedLegacyXor
+        );
+        ensure!(
             self.decimals <= common::DEFAULT_BALANCE_PRECISION,
             Error::<T>::UnsupportedAssetPrecision
         );
@@ -634,7 +676,7 @@ impl<T: Config> OutgoingAddToken<T> {
 }
 
 /// Sidechain-compatible version of `OutgoingAddToken`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingAddTokenEncoded {
     pub token_address: EthAddress,
@@ -664,7 +706,7 @@ impl OutgoingAddTokenEncoded {
 }
 
 /// Outgoing request for adding a peer.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingAddPeer<T: Config> {
@@ -767,7 +809,7 @@ impl<T: Config> OutgoingAddPeer<T> {
 }
 
 /// Old contracts-compatible `add peer` request. Will be removed in the future.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingAddPeerCompat<T: Config> {
@@ -859,7 +901,7 @@ impl<T: Config> OutgoingAddPeerCompat<T> {
 }
 
 /// Outgoing request for removing a peer.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingRemovePeer<T: Config> {
@@ -991,7 +1033,7 @@ impl<T: Config> OutgoingRemovePeer<T> {
 }
 
 /// Old contracts-compatible `remove peer` request. Will be removed in the future.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingRemovePeerCompat<T: Config> {
@@ -1068,7 +1110,7 @@ impl<T: Config> OutgoingRemovePeerCompat<T> {
 }
 
 /// Sidechain-compatible version of `OutgoingAddPeer`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingAddPeerEncoded {
     pub peer_address: EthAddress,
@@ -1093,7 +1135,7 @@ impl OutgoingAddPeerEncoded {
 }
 
 /// Sidechain-compatible version of `OutgoingRemovePeer`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingRemovePeerEncoded {
     pub peer_address: EthAddress,
@@ -1126,7 +1168,7 @@ impl OutgoingRemovePeerEncoded {
 /// as possible.
 /// 2. Migrate the bridge. At this stage a new Sidechain contract should be deployed and Thischain
 /// should be switched to it, so the old contract can't be used anymore.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingPrepareForMigration<T: Config> {
@@ -1190,7 +1232,7 @@ impl<T: Config> OutgoingPrepareForMigration<T> {
 }
 
 /// Sidechain-compatible version of `OutgoingPrepareForMigration`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingPrepareForMigrationEncoded {
     pub this_contract_address: EthAddress,
@@ -1216,7 +1258,7 @@ impl OutgoingPrepareForMigrationEncoded {
 
 /// Outgoing request for migrating the bridge. For the full migration process description see
 /// `OutgoingPrepareForMigration` request.
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[scale_info(skip_type_params(T))]
 pub struct OutgoingMigrate<T: Config> {
@@ -1301,7 +1343,7 @@ impl<T: Config> OutgoingMigrate<T> {
 }
 
 /// Sidechain-compatible version of `OutgoingMigrate`.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct OutgoingMigrateEncoded {
     pub this_contract_address: EthAddress,
@@ -1326,12 +1368,9 @@ impl OutgoingMigrateEncoded {
 
 /// A helper structure used to add or remove peer on Ethereum network.
 ///
-/// On Ethereum network there are 3 bridge contracts: Main, XOR and VAL. Each of them has a set of
-/// peers' public keys that's need to be almost the same at any time (+- 1 signatory). To
-/// synchronize them, we use this structure, that contains the current readiness state of each
-/// contract. We add or remove peer only when all of them is in `true` state
-/// (see `EthPeersSync::is_ready`).
-#[derive(Clone, Default, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+/// On Ethereum network, legacy peer compatibility still applies to the Main and VAL contracts.
+/// The old XOR contract is deprecated and no longer gates peer readiness.
+#[derive(Clone, Default, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct EthPeersSync {
     is_bridge_ready: bool,
@@ -1341,7 +1380,7 @@ pub struct EthPeersSync {
 
 impl EthPeersSync {
     pub fn is_ready(&self) -> bool {
-        self.is_bridge_ready && self.is_xor_ready && self.is_val_ready
+        self.is_bridge_ready && self.is_val_ready
     }
 
     pub fn bridge_ready(&mut self) {

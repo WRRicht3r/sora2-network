@@ -80,7 +80,8 @@ use bridge_types::GenericNetworkId;
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use common::prelude::Balance;
 use common::{
-    AssetInfoProvider, AssetName, AssetSymbol, BalancePrecision, DEFAULT_BALANCE_PRECISION,
+    AssetInfoProvider, AssetName, AssetSymbol, BalancePrecision, Denominator,
+    DEFAULT_BALANCE_PRECISION,
 };
 use core::stringify;
 use frame_support::__private::log::{debug, error, info, warn};
@@ -107,7 +108,6 @@ use requests::*;
 use serde::{Deserialize, Serialize};
 use sp_core::{H160, H256};
 use sp_runtime::DispatchError;
-use sp_runtime::RuntimeDebug;
 use sp_std::borrow::Cow;
 use sp_std::collections::btree_set::BTreeSet;
 use sp_std::fmt::{self, Debug};
@@ -163,6 +163,9 @@ pub const STORAGE_PEER_MARKER_KEY: &[u8] = b"eth-bridge-ocw::peer-marker";
 /// Legacy OCW activation key (historically used for raw seed bytes).
 /// Kept for backward compatibility with existing offchain DBs.
 pub const STORAGE_PEER_SECRET_KEY: &[u8] = b"eth-bridge-ocw::secret-key";
+pub const STORAGE_BOOTSTRAP_READY_KEY: &[u8] = b"eth-bridge-ocw::bootstrap-ready";
+pub const STORAGE_LOCAL_SIGNING_KEY_READY_KEY: &[u8] = b"eth-bridge-ocw::local-signing-key-ready";
+pub const STORAGE_SUBSTRATE_RPC_CONFIGURED_KEY: &[u8] = b"eth-bridge-ocw::substrate-rpc-configured";
 pub const STORAGE_ETH_NODE_PARAMS: &str = "eth-bridge-ocw::node-params";
 pub const STORAGE_NETWORK_IDS_KEY: &[u8] = b"eth-bridge-ocw::network-ids";
 pub const STORAGE_PENDING_TRANSACTIONS_KEY: &[u8] = b"eth-bridge-ocw::pending-transactions";
@@ -170,15 +173,32 @@ pub const STORAGE_FAILED_PENDING_TRANSACTIONS_KEY: &[u8] =
     b"eth-bridge-ocw::failed-pending-transactions";
 pub const STORAGE_SUB_TO_HANDLE_FROM_HEIGHT_KEY: &[u8] =
     b"eth-bridge-ocw::sub-to-handle-from-height";
+pub const STORAGE_SIDECHAIN_RPC_CONFIGURED_KEY: &str = "eth-bridge-ocw::sidechain-rpc-configured";
+pub const STORAGE_LOCAL_PEER_READY_KEY: &str = "eth-bridge-ocw::local-peer-ready";
+pub const STORAGE_OUTGOING_PENDING_REQUESTS_KEY: &str = "eth-bridge-ocw::outgoing-pending-requests";
+pub const STORAGE_OUTGOING_ZERO_APPROVAL_REQUESTS_KEY: &str =
+    "eth-bridge-ocw::outgoing-zero-approval-requests";
+pub const STORAGE_OUTGOING_APPROVAL_FAILURES_KEY: &str =
+    "eth-bridge-ocw::outgoing-approval-failures";
+pub const OUTGOING_APPROVAL_FAILURE_NO_LOCAL_PEER_KEY: &str = "no_local_peer_key";
+pub const OUTGOING_APPROVAL_FAILURE_FAILED_SIGN: &str = "failed_sign";
+pub const OUTGOING_APPROVAL_FAILURE_FAILED_SEND_SIGNED_TX: &str = "failed_send_signed_tx";
+pub const OUTGOING_APPROVAL_FAILURE_SIDECHAIN_RPC_PREFLIGHT: &str =
+    "failed_sidechain_rpc_preflight";
 
 /// Contract's `Deposit(bytes32,uint256,address,bytes32)` event topic.
 pub const DEPOSIT_TOPIC: H256 = H256(hex!(
     "85c0fa492ded927d3acca961da52b0dda1debb06d8c27fe189315f06bb6e26c8"
 ));
+pub const LEGACY_ETHEREUM_XOR_TOKEN_ADDRESS: EthAddress =
+    H160(hex!("40fd72257597aa14c7231a7b1aaa29fce868f677"));
+pub const LEGACY_ETHEREUM_XOR_MASTER_CONTRACT_ADDRESS: EthAddress =
+    H160(hex!("c08edf13be9b9cc584c5da8004ce7e6be63c1316"));
 pub const OFFCHAIN_TRANSACTION_WEIGHT_LIMIT: Weight =
     Weight::from_parts(10_000_000_000_000_000u64, 10_000_000_000_000_000u64);
 const MAX_PENDING_TX_BLOCKS_PERIOD: u32 = 100;
 const RE_HANDLE_TXS_PERIOD: u32 = 200;
+pub const ZERO_APPROVAL_OUTGOING_RETRY_PERIOD: u32 = 10;
 /// Minimum peers required to start bridge migration
 pub const MINIMUM_PEERS_FOR_MIGRATION: usize = 3;
 
@@ -189,9 +209,7 @@ type BridgeTimepoint<T> = Timepoint<T>;
 type BridgeNetworkId<T> = <T as Config>::NetworkId;
 
 /// Ethereum node parameters (url, credentials).
-#[derive(
-    Encode, Decode, Eq, PartialEq, Clone, PartialOrd, Ord, RuntimeDebug, scale_info::TypeInfo,
-)]
+#[derive(Encode, Decode, Eq, PartialEq, Clone, PartialOrd, Ord, Debug, scale_info::TypeInfo)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 pub struct NodeParams {
     url: String,
@@ -200,14 +218,14 @@ pub struct NodeParams {
 
 /// Local peer config. Contains a set of networks that the peer is responsible for.
 #[cfg(feature = "std")]
-#[derive(Clone, RuntimeDebug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerConfig<NetworkId: std::hash::Hash + Eq> {
     pub networks: HashMap<NetworkId, NodeParams>,
 }
 
 /// Network-specific parameters.
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 pub struct NetworkParams<AccountId: Ord> {
     pub bridge_contract_address: EthAddress,
     pub initial_peers: BTreeSet<AccountId>,
@@ -230,7 +248,7 @@ pub struct NetworkParams<AccountId: Ord> {
         deserialize = "<T as frame_system::pallet::Config>::AccountId: Deserialize<'de>, <T as assets::Config>::AssetId: Deserialize<'de>"
     ))
 )]
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 #[scale_info(skip_type_params(T))]
 pub struct NetworkConfig<T: Config> {
     pub initial_peers: BTreeSet<<T as frame_system::pallet::Config>::AccountId>,
@@ -277,7 +295,7 @@ impl<T: Config> BridgeAssetData<T> {
 
 /// Bridge status.
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, Debug, scale_info::TypeInfo)]
 pub enum BridgeStatus {
     Initialized,
     Migrating,
@@ -292,7 +310,7 @@ impl Default for BridgeStatus {
 /// Bridge asset parameters.
 #[cfg_attr(not(feature = "std"), derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[derive(Clone, Encode, Decode, PartialEq, Eq, RuntimeDebug, scale_info::TypeInfo)]
+#[derive(Clone, Encode, Decode, PartialEq, Eq, Debug, scale_info::TypeInfo)]
 pub enum AssetConfig<AssetId> {
     Thischain {
         id: AssetId,
@@ -338,15 +356,7 @@ impl<AssetId> AssetConfig<AssetId> {
 /// Bridge function signature version
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[derive(
-    Clone,
-    Copy,
-    Encode,
-    Decode,
-    DecodeWithMemTracking,
-    PartialEq,
-    Eq,
-    RuntimeDebug,
-    scale_info::TypeInfo,
+    Clone, Copy, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, Debug, scale_info::TypeInfo,
 )]
 pub enum BridgeSignatureVersion {
     V1,
@@ -436,7 +446,7 @@ pub mod pallet {
     }
 
     /// The current storage version.
-    const STORAGE_VERSION: StorageVersion = StorageVersion::new(2);
+    const STORAGE_VERSION: StorageVersion = StorageVersion::new(3);
 
     #[pallet::pallet]
     #[pallet::storage_version(STORAGE_VERSION)]
@@ -466,6 +476,7 @@ pub mod pallet {
                 (legacy_ref.get::<Vec<u8>>().ok().flatten(), true)
             };
             if marker.is_none() {
+                crate::offchain::set_offchain_metric_u64(STORAGE_BOOTSTRAP_READY_KEY, 0);
                 debug!("Peer marker not found. Skipping off-chain procedure.");
                 return;
             }
@@ -473,11 +484,14 @@ pub mod pallet {
             let local_keys =
                 <T::PeerId as AppCrypto<T::Public, T::Signature>>::RuntimeAppPublic::all();
             if local_keys.is_empty() {
+                crate::offchain::set_offchain_metric_u64(STORAGE_LOCAL_SIGNING_KEY_READY_KEY, 0);
+                crate::offchain::set_offchain_metric_u64(STORAGE_BOOTSTRAP_READY_KEY, 0);
                 debug!(
                     "Bridge peer key not found in local keystore. Skipping off-chain procedure."
                 );
                 return;
             }
+            crate::offchain::set_offchain_metric_u64(STORAGE_LOCAL_SIGNING_KEY_READY_KEY, 1);
 
             // For the new marker format (public key bytes), ensure the marker corresponds to a
             // currently available local key.
@@ -485,6 +499,7 @@ pub mod pallet {
                 let marker_matches = local_keys.iter().any(|key| key.to_raw_vec() == marker);
                 let is_legacy_secret_seed = marker_from_legacy_key && marker.len() == 32;
                 if !marker_matches && !is_legacy_secret_seed {
+                    crate::offchain::set_offchain_metric_u64(STORAGE_BOOTSTRAP_READY_KEY, 0);
                     debug!(
                         "Bridge peer marker doesn't match a local key. Skipping off-chain procedure."
                     );
@@ -500,9 +515,11 @@ pub mod pallet {
                 Peers::<T>::iter_values().any(|peers| peers.contains(&account))
             });
             if !has_local_peer_account {
+                crate::offchain::set_offchain_metric_u64(STORAGE_BOOTSTRAP_READY_KEY, 0);
                 debug!("No local bridge peer account configured. Skipping off-chain procedure.");
                 return;
             }
+            crate::offchain::set_offchain_metric_u64(STORAGE_BOOTSTRAP_READY_KEY, 1);
 
             let mut lock = StorageLock::<'_, Time>::with_deadline(
                 b"eth-bridge-ocw::lock",
@@ -999,7 +1016,7 @@ pub mod pallet {
         /// Verifies the peer signature of the given request and adds it to `RequestApprovals`.
         /// Once quorum is collected, the request gets finalized and removed from request queue.
         #[pallet::call_index(12)]
-        #[pallet::weight(<T as Config>::WeightInfo::approve_request())]
+        #[pallet::weight(<T as Config>::WeightInfo::approve_request_finalize())]
         pub fn approve_request(
             origin: OriginFor<T>,
             ocw_public: ecdsa::Public,
@@ -1119,6 +1136,15 @@ pub mod pallet {
             );
             ensure_root(origin)?;
             T::AssetInfoProvider::ensure_asset_exists(&asset_id)?;
+            ensure!(
+                network_id != T::GetEthNetworkId::get()
+                    || !Self::is_legacy_ethereum_xor_asset(&asset_id),
+                Error::<T>::DeprecatedLegacyXor
+            );
+            ensure!(
+                !Self::is_deprecated_sidechain_token(network_id, &token_address),
+                Error::<T>::DeprecatedLegacyXor
+            );
             ensure!(
                 !RegisteredAsset::<T>::contains_key(network_id, &asset_id),
                 Error::<T>::TokenIsAlreadyAdded
@@ -1371,6 +1397,8 @@ pub mod pallet {
         FailedToApplyDenomination,
         /// Asset can't be removed while it has active outgoing transfer requests.
         ActiveOutgoingTransferRequest,
+        /// Legacy Ethereum XOR must not be bridged or registered again.
+        DeprecatedLegacyXor,
     }
 
     impl<T: Config> Error<T> {
@@ -1509,6 +1537,28 @@ pub mod pallet {
         T::AssetId,
         EthAddress,
     >;
+
+    /// Sidechain tokens that must not be accepted again.
+    #[pallet::storage]
+    #[pallet::getter(fn deprecated_sidechain_token)]
+    pub(super) type DeprecatedSidechainTokens<T: Config> = StorageDoubleMap<
+        _,
+        Twox64Concat,
+        BridgeNetworkId<T>,
+        Blake2_128Concat,
+        EthAddress,
+        bool,
+        ValueQuery,
+    >;
+
+    /// One-shot marker for the legacy Ethereum XOR decommissioning migration.
+    #[pallet::storage]
+    pub(super) type LegacyEthereumXorDecommissioned<T: Config> = StorageValue<_, bool, ValueQuery>;
+
+    /// Block at which the legacy Ethereum XOR decommissioning migration ran.
+    #[pallet::storage]
+    pub(super) type LegacyEthereumXorDecommissionedAt<T: Config> =
+        StorageValue<_, frame_system::pallet_prelude::BlockNumberFor<T>>;
 
     /// Network peers set.
     #[pallet::storage]
@@ -1907,6 +1957,98 @@ impl<T: Config> Pallet<T> {
         RequestApprovers::<T>::remove(network_id, hash);
     }
 
+    pub fn is_deprecated_sidechain_token(
+        network_id: T::NetworkId,
+        token_address: &EthAddress,
+    ) -> bool {
+        DeprecatedSidechainTokens::<T>::get(network_id, token_address)
+            || (network_id == T::GetEthNetworkId::get()
+                && *token_address == LEGACY_ETHEREUM_XOR_TOKEN_ADDRESS)
+    }
+
+    pub fn is_legacy_ethereum_xor_asset(asset_id: &AssetIdOf<T>) -> bool {
+        *asset_id == common::XOR.into()
+    }
+
+    pub fn is_ethereum_xor_thischain_registration(
+        network_id: T::NetworkId,
+        asset_id: &AssetIdOf<T>,
+    ) -> bool {
+        network_id == T::GetEthNetworkId::get()
+            && Self::is_legacy_ethereum_xor_asset(asset_id)
+            && crate::migration::is_legacy_ethereum_xor_decommissioned::<T>()
+            && matches!(
+                RegisteredAsset::<T>::get(network_id, asset_id),
+                Some(AssetKind::Thischain)
+            )
+            && !RegisteredSidechainToken::<T>::contains_key(network_id, asset_id)
+    }
+
+    pub fn bridge_denomination_factor(
+        network_id: T::NetworkId,
+        asset_id: &AssetIdOf<T>,
+    ) -> Balance {
+        if Self::is_ethereum_xor_thischain_registration(network_id, asset_id) {
+            Balance::one()
+        } else {
+            T::Denominator::current_factor(asset_id)
+        }
+    }
+
+    pub fn is_decommissioned_legacy_ethereum_xor_asset(
+        network_id: T::NetworkId,
+        asset_id: &AssetIdOf<T>,
+    ) -> bool {
+        network_id == T::GetEthNetworkId::get()
+            && LegacyEthereumXorDecommissioned::<T>::get()
+            && Self::is_legacy_ethereum_xor_asset(asset_id)
+            && !Self::is_ethereum_xor_thischain_registration(network_id, asset_id)
+    }
+
+    pub fn is_decommissioned_legacy_ethereum_xor_outgoing_transfer_request(
+        network_id: T::NetworkId,
+        request_hash: &H256,
+    ) -> bool {
+        let Some(decommissioned_at) = LegacyEthereumXorDecommissionedAt::<T>::get() else {
+            return network_id == T::GetEthNetworkId::get()
+                && LegacyEthereumXorDecommissioned::<T>::get()
+                && matches!(
+                    Requests::<T>::get(network_id, request_hash),
+                    Some(OffchainRequest::Outgoing(OutgoingRequest::Transfer(request), _))
+                        if Self::is_legacy_ethereum_xor_asset(&request.asset_id)
+                );
+        };
+
+        network_id == T::GetEthNetworkId::get()
+            && LegacyEthereumXorDecommissioned::<T>::get()
+            && RequestSubmissionHeight::<T>::get(network_id, request_hash) < decommissioned_at
+            && matches!(
+                Requests::<T>::get(network_id, request_hash),
+                Some(OffchainRequest::Outgoing(OutgoingRequest::Transfer(request), _))
+                    if Self::is_legacy_ethereum_xor_asset(&request.asset_id)
+            )
+    }
+
+    pub fn is_legacy_ethereum_xor_mapping(
+        network_id: T::NetworkId,
+        asset_id: &AssetIdOf<T>,
+    ) -> bool {
+        if network_id != T::GetEthNetworkId::get() || !Self::is_legacy_ethereum_xor_asset(asset_id)
+        {
+            return false;
+        }
+        Self::is_deprecated_sidechain_token_mapping(network_id, asset_id)
+    }
+
+    pub fn is_deprecated_sidechain_token_mapping(
+        network_id: T::NetworkId,
+        asset_id: &AssetIdOf<T>,
+    ) -> bool {
+        RegisteredSidechainToken::<T>::get(network_id, asset_id)
+            .map(|token| Self::is_deprecated_sidechain_token(network_id, &token))
+            .unwrap_or(false)
+    }
+
     /// Registers new sidechain asset and grants mint permission to the bridge account.
     fn register_sidechain_asset(
         token_address: EthAddress,
@@ -1915,6 +2057,10 @@ impl<T: Config> Pallet<T> {
         name: AssetName,
         network_id: T::NetworkId,
     ) -> Result<T::AssetId, DispatchError> {
+        ensure!(
+            !Self::is_deprecated_sidechain_token(network_id, &token_address),
+            Error::<T>::DeprecatedLegacyXor
+        );
         ensure!(
             RegisteredSidechainAsset::<T>::get(network_id, &token_address).is_none(),
             Error::<T>::TokenIsAlreadyAdded
@@ -2036,6 +2182,10 @@ impl<T: Config> Pallet<T> {
         let request = Requests::<T>::get(net_id, hash)
             .and_then(|x| x.into_outgoing().map(|x| x.0))
             .ok_or(Error::<T>::UnknownRequest)?;
+        ensure!(
+            !Self::is_decommissioned_legacy_ethereum_xor_outgoing_transfer_request(net_id, &hash),
+            Error::<T>::DeprecatedLegacyXor
+        );
         let request_encoded = request.to_eth_abi(hash)?;
         if !Self::verify_message(
             request_encoded.as_raw(),
@@ -2066,7 +2216,7 @@ impl<T: Config> Pallet<T> {
                 author, hash
             );
             RequestApprovers::<T>::insert(net_id, &hash, &approvers);
-            return Ok(None);
+            return Ok(Some(<T as Config>::WeightInfo::approve_request()));
         }
         approvals.insert(signature_params);
         RequestApprovals::<T>::insert(net_id, &hash, &approvals);
@@ -2086,7 +2236,7 @@ impl<T: Config> Pallet<T> {
             let weight_info = <T as Config>::WeightInfo::approve_request_finalize();
             return Ok(Some(weight_info));
         }
-        Ok(None)
+        Ok(Some(<T as Config>::WeightInfo::approve_request()))
     }
 
     fn is_additional_signature_needed(net_id: T::NetworkId, request: &OutgoingRequest<T>) -> bool {
@@ -2121,11 +2271,20 @@ impl<T: Config> Pallet<T> {
 
     pub fn is_add_asset_request_pending(network_id: T::NetworkId, asset_id: AssetIdOf<T>) -> bool {
         RequestsQueue::<T>::get(network_id).into_iter().any(|hash| {
+            let is_active = matches!(
+                RequestStatuses::<T>::get(network_id, hash),
+                Some(
+                    RequestStatus::Pending
+                        | RequestStatus::ApprovalsReady
+                        | RequestStatus::Frozen
+                        | RequestStatus::Broken(_, _)
+                )
+            );
             matches!(
                 Requests::<T>::get(network_id, hash),
                 Some(OffchainRequest::Outgoing(OutgoingRequest::AddAsset(req), _))
                     if req.asset_id == asset_id
-            )
+            ) && is_active
         })
     }
 
@@ -2134,11 +2293,20 @@ impl<T: Config> Pallet<T> {
         token_address: EthAddress,
     ) -> bool {
         RequestsQueue::<T>::get(network_id).into_iter().any(|hash| {
+            let is_active = matches!(
+                RequestStatuses::<T>::get(network_id, hash),
+                Some(
+                    RequestStatus::Pending
+                        | RequestStatus::ApprovalsReady
+                        | RequestStatus::Frozen
+                        | RequestStatus::Broken(_, _)
+                )
+            );
             matches!(
                 Requests::<T>::get(network_id, hash),
                 Some(OffchainRequest::Outgoing(OutgoingRequest::AddToken(req), _))
                     if req.token_address == token_address
-            )
+            ) && is_active
         })
     }
 
@@ -2174,6 +2342,15 @@ impl<T: Config>
         let Ok(network_id) = Self::ensure_generic_network(network_id) else {
             return false;
         };
+        if network_id == T::GetEthNetworkId::get()
+            && Self::is_legacy_ethereum_xor_asset(&asset_id)
+            && !Self::is_ethereum_xor_thischain_registration(network_id, &asset_id)
+        {
+            return false;
+        }
+        if Self::is_deprecated_sidechain_token_mapping(network_id, &asset_id) {
+            return false;
+        }
         RegisteredAsset::<T>::contains_key(network_id, &asset_id)
     }
 
@@ -2222,28 +2399,39 @@ impl<T: Config>
             return vec![];
         };
         RegisteredAsset::<T>::iter_prefix(network_id)
-            .map(|(asset_id, _kind)| {
-                let evm_address =
-                    RegisteredSidechainToken::<T>::get(network_id, &asset_id).map(|x| H160(x.0));
+            .filter_map(|(asset_id, _kind)| {
+                if network_id == T::GetEthNetworkId::get()
+                    && Self::is_legacy_ethereum_xor_asset(&asset_id)
+                    && !Self::is_ethereum_xor_thischain_registration(network_id, &asset_id)
+                {
+                    return None;
+                }
+                let token_address = RegisteredSidechainToken::<T>::get(network_id, &asset_id);
+                if token_address
+                    .as_ref()
+                    .map(|address| Self::is_deprecated_sidechain_token(network_id, address))
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+                let evm_address = token_address.map(|x| H160(x.0));
                 let precision = evm_address.map(|_address| {
                     let precision = SidechainAssetPrecision::<T>::get(network_id, &asset_id);
                     precision
                 });
 
-                let app_kind = if asset_id == common::XOR.into() {
-                    EVMAppKind::XorMaster
-                } else if asset_id == common::VAL.into() {
+                let app_kind = if asset_id == common::VAL.into() {
                     EVMAppKind::ValMaster
                 } else {
                     EVMAppKind::HashiBridge
                 };
 
-                BridgeAssetInfo::EVMLegacy(EVMLegacyAssetInfo {
+                Some(BridgeAssetInfo::EVMLegacy(EVMLegacyAssetInfo {
                     asset_id: asset_id.into(),
                     app_kind,
                     evm_address,
                     precision,
-                })
+                }))
             })
             .collect()
     }
@@ -2260,16 +2448,6 @@ impl<T: Config>
                 EVMAppInfo {
                     evm_address: bridge_address,
                     app_kind: EVMAppKind::HashiBridge,
-                },
-            );
-            apps.push(app);
-        }
-        if let Ok(xor_master) = XorMasterContractAddress::<T>::try_get() {
-            let app = BridgeAppInfo::EVM(
-                generic_network_id,
-                EVMAppInfo {
-                    evm_address: xor_master,
-                    app_kind: EVMAppKind::XorMaster,
                 },
             );
             apps.push(app);

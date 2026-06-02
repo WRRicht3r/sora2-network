@@ -556,12 +556,23 @@ macro_rules! mock_dispatch_config {
             type Origin = RuntimeOrigin;
             type OriginOutput = OriginOutput;
             type WeightInfo = ();
+            #[cfg(feature = "runtime-benchmarks")]
             type BenchmarkHelper = ();
         }
     };
 }
 
 /// Mock of pallet `evm_fungible_app::Config`.
+pub struct NoDeprecatedEVMTokenAddress;
+
+impl frame_support::traits::Get<Option<(bridge_types::EVMChainId, bridge_types::H160)>>
+    for NoDeprecatedEVMTokenAddress
+{
+    fn get() -> Option<(bridge_types::EVMChainId, bridge_types::H160)> {
+        None
+    }
+}
+
 #[macro_export]
 macro_rules! mock_evm_fungible_app_config {
     ($runtime:ty) => {
@@ -576,6 +587,7 @@ macro_rules! mock_evm_fungible_app_config {
             type MessageStatusNotifier = BridgeProxy;
             type OutboundChannel = BridgeOutboundChannel;
             type PriorityFee = frame_support::traits::ConstU128<100>;
+            type DeprecatedTokenAddress = $crate::mock::NoDeprecatedEVMTokenAddress;
             type WeightInfo = ();
         }
     };
@@ -832,6 +844,7 @@ macro_rules! mock_orml_tokens_config {
         impl orml_tokens::Config for $runtime {
             type Amount = Amount;
             type Balance = Balance;
+            #[cfg(feature = "runtime-benchmarks")]
             type BenchmarkHelper = ();
             type CurrencyHooks = ();
             type CurrencyId = <$runtime as assets::Config>::AssetId;
@@ -1112,7 +1125,7 @@ macro_rules! mock_pswap_distribution_config {
         use sp_runtime::Permill;
         frame_support::parameter_types! {
             pub GetIncentiveAssetId: AssetId = common::PSWAP.into();
-            pub GetBuyBackFractions: Vec<(AssetId, Permill)> = vec![(common::KUSD.into(), Permill::from_rational(39u32, 100u32)), (common::TBCD.into(), Permill::from_rational(1u32, 100u32))];
+            pub GetBuyBackFractions: Vec<(AssetId, Permill)> = vec![(common::KUSD.into(), Permill::from_rational(4u32, 100u32)), (common::XOR.into(), Permill::from_rational(36u32, 100u32))];
         }
         impl pswap_distribution::Config for $runtime {
             const PSWAP_BURN_PERCENT: sp_runtime::Percent = sp_runtime::Percent::from_percent(3);
@@ -1202,10 +1215,10 @@ macro_rules! mock_soratopia_config {
     ($runtime:ty) => {
         frame_support::parameter_types! {
             pub const CheckInTransferAmount: Balance = 1_000;
-            pub AdminAccount: AccountId = hex_literal::hex!("8eaf04151687736326c9fea17e25fc5287613693c912909cb226aa4794f26a48").into();
+            pub const CheckInInterval: BlockNumber = 10;
         }
         impl soratopia::Config for $runtime {
-            type AdminAccount = AdminAccount;
+            type CheckInInterval = CheckInInterval;
             type CheckInTransferAmount = CheckInTransferAmount;
             type RuntimeEvent = RuntimeEvent;
             type WeightInfo = ();
@@ -1242,6 +1255,7 @@ macro_rules! mock_tokens_config {
         impl tokens::Config for $runtime {
             type Amount = Amount;
             type Balance = Balance;
+            #[cfg(feature = "runtime-benchmarks")]
             type BenchmarkHelper = ();
             type CurrencyHooks = ();
             type CurrencyId = <$runtime as assets::Config>::AssetId;

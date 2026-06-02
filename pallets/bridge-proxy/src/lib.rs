@@ -19,7 +19,7 @@ use bridge_types::{
         MessageStatusNotifier, TimepointProvider,
     },
     types::{AssetKind, MessageDirection, MessageStatus},
-    GenericAccount, GenericNetworkId, GenericTimepoint, MainnetAccountId, H160, H256,
+    GenericAccount, GenericNetworkId, GenericTimepoint, MainnetAccountId, SubNetworkId, H160, H256,
 };
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use common::{prelude::FixedWrapper, AssetIdOf, Balance, BalanceOf, OnDenominate};
@@ -27,7 +27,6 @@ use common::{AssetInfoProvider, AssetManager, ReferencePriceProvider};
 use frame_support::__private::log;
 use frame_support::dispatch::DispatchResult;
 use frame_support::ensure;
-use frame_support::sp_runtime::RuntimeDebug;
 use scale_info::TypeInfo;
 use sp_runtime::traits::Convert;
 use sp_runtime::DispatchError;
@@ -39,7 +38,7 @@ pub use weights::WeightInfo;
 pub const BRIDGE_TECH_ACC_PREFIX: &[u8] = b"bridge";
 pub const BRIDGE_FEE_TECH_ACC_PREFIX: &[u8] = b"bridge-fee";
 
-#[derive(Clone, RuntimeDebug, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, TypeInfo)]
+#[derive(Clone, Debug, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, TypeInfo)]
 #[scale_info(skip_type_params(T))]
 pub struct BridgeRequest<AssetId> {
     source: GenericAccount,
@@ -52,7 +51,7 @@ pub struct BridgeRequest<AssetId> {
     direction: MessageDirection,
 }
 
-#[derive(Clone, RuntimeDebug, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, TypeInfo)]
+#[derive(Clone, Debug, Encode, Decode, DecodeWithMemTracking, PartialEq, Eq, TypeInfo)]
 pub struct TransferLimitSettings<BlockNumber> {
     max_amount: Balance,
     period_blocks: BlockNumber,
@@ -468,6 +467,36 @@ where
 }
 
 impl<T: Config> Pallet<T> {
+    fn should_denominate_legacy_xor_locked_asset(
+        network_id: GenericNetworkId,
+        asset_id: AssetIdOf<T>,
+    ) -> bool {
+        asset_id == common::XOR.into()
+            && matches!(
+                network_id,
+                GenericNetworkId::EVMLegacy(_)
+                    | GenericNetworkId::Sub(SubNetworkId::Kusama | SubNetworkId::Polkadot)
+            )
+    }
+
+    pub fn denominate_legacy_xor_locked_assets(factor: &BalanceOf<T>) -> DispatchResult {
+        let mut updates = Vec::new();
+        for (network_id, asset_id, value) in LockedAssets::<T>::iter() {
+            if Self::should_denominate_legacy_xor_locked_asset(network_id, asset_id) {
+                let updated_value = value.checked_div(*factor).ok_or(DispatchError::Arithmetic(
+                    sp_runtime::ArithmeticError::DivisionByZero,
+                ))?;
+                updates.push((network_id, asset_id, updated_value));
+            }
+        }
+
+        for (network_id, asset_id, value) in updates {
+            LockedAssets::<T>::insert(network_id, asset_id, value);
+        }
+
+        Ok(())
+    }
+
     pub fn bridge_tech_account(
         network_id: GenericNetworkId,
     ) -> <T as technical::Config>::TechAccountId {
@@ -756,13 +785,6 @@ impl<T: Config> EVMBridgeWithdrawFee<T::AccountId, AssetIdOf<T>> for Pallet<T> {
 impl<T: Config> OnDenominate<BalanceOf<T>> for Pallet<T> {
     fn on_denominate(factor: &BalanceOf<T>) -> DispatchResult {
         frame_support::__private::log::info!("{}::on_denominate({})", module_path!(), factor);
-        LockedAssets::<T>::translate(|_, asset_id, value| {
-            if asset_id == common::XOR.into() || asset_id == common::TBCD.into() {
-                Some(value / factor)
-            } else {
-                Some(value)
-            }
-        });
-        Ok(())
+        Self::denominate_legacy_xor_locked_assets(factor)
     }
 }

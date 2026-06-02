@@ -30,15 +30,21 @@
 
 use super::mock::*;
 use super::Error;
-use crate::requests::{IncomingRequestKind, IncomingTransactionRequestKind, RequestStatus};
+use crate::requests::{
+    IncomingMetaRequestKind, IncomingRequest, IncomingRequestKind, IncomingTransactionRequestKind,
+    RequestStatus,
+};
 use crate::tests::mock::{get_account_id_from_seed, ExtBuilder};
 use crate::tests::{last_outgoing_request, last_request, Assets, ETH_NETWORK_ID};
 use crate::types::{Log, TransactionReceipt};
 use crate::{
     types, AssetConfig, EthAddress, CONFIRMATION_INTERVAL, MAX_FAILED_SEND_SIGNED_TX_RETRIES,
-    MAX_PENDING_TX_BLOCKS_PERIOD, RE_HANDLE_TXS_PERIOD, STORAGE_ETH_NODE_PARAMS,
+    MAX_PENDING_TX_BLOCKS_PERIOD, OUTGOING_APPROVAL_FAILURE_FAILED_SEND_SIGNED_TX,
+    RE_HANDLE_TXS_PERIOD, STORAGE_ETH_NODE_PARAMS, STORAGE_LOCAL_PEER_READY_KEY,
+    STORAGE_OUTGOING_APPROVAL_FAILURES_KEY, STORAGE_OUTGOING_ZERO_APPROVAL_REQUESTS_KEY,
     STORAGE_PEER_MARKER_KEY, STORAGE_PEER_SECRET_KEY, STORAGE_PENDING_TRANSACTIONS_KEY,
     SUBSTRATE_HANDLE_BLOCK_COUNT_PER_BLOCK, SUBSTRATE_MAX_BLOCK_NUM_EXPECTING_UNTIL_FINALIZATION,
+    ZERO_APPROVAL_OUTGOING_RETRY_PERIOD,
 };
 use codec::Encode;
 use common::{DEFAULT_BALANCE_PRECISION, VAL, XOR};
@@ -68,6 +74,63 @@ fn ocw_should_not_handle_non_finalized_outgoing_request() {
         assert_eq!(
             crate::RequestApprovals::<Runtime>::get(net_id, hash).len(),
             0
+        );
+    });
+}
+
+#[test]
+fn ocw_mark_as_done_targets_original_outgoing_hash() {
+    let mut builder = ExtBuilder::new();
+    builder.add_network(
+        vec![AssetConfig::Thischain { id: XOR.into() }],
+        None,
+        Some(1),
+        Default::default(),
+    );
+    let (mut ext, mut state) = builder.build();
+    ext.execute_with(|| {
+        let net_id = ETH_NETWORK_ID;
+        let alice = get_account_id_from_seed::<sr25519::Public>("Alice");
+        let outgoing_hash = H256::repeat_byte(0x42);
+
+        crate::RequestStatuses::<Runtime>::insert(
+            net_id,
+            outgoing_hash,
+            RequestStatus::ApprovalsReady,
+        );
+        assert_ok!(EthBridge::request_from_sidechain(
+            RuntimeOrigin::signed(alice.clone()),
+            outgoing_hash,
+            IncomingRequestKind::Meta(IncomingMetaRequestKind::MarkAsDone),
+            net_id
+        ));
+        let load_hash = last_request(net_id).unwrap().hash();
+        assert_ne!(load_hash, outgoing_hash);
+
+        state.push_response(types::U64::from(777u64));
+        state.push_response(true);
+        state.run_next_offchain_and_dispatch_txs();
+
+        let incoming_hash = crate::LoadToIncomingRequestHash::<Runtime>::get(net_id, load_hash);
+        assert_ne!(incoming_hash, H256::zero());
+        let incoming = crate::Requests::<Runtime>::get(net_id, incoming_hash)
+            .unwrap()
+            .into_incoming()
+            .unwrap()
+            .0;
+        let IncomingRequest::MarkAsDone(mark_as_done) = incoming else {
+            panic!("expected MarkAsDone incoming request");
+        };
+        assert_eq!(mark_as_done.outgoing_request_hash, outgoing_hash);
+        assert_eq!(mark_as_done.initial_request_hash, load_hash);
+        assert_eq!(mark_as_done.author, alice);
+        assert_eq!(
+            crate::RequestStatuses::<Runtime>::get(net_id, load_hash),
+            Some(RequestStatus::Done)
+        );
+        assert_eq!(
+            crate::RequestStatuses::<Runtime>::get(net_id, incoming_hash),
+            Some(RequestStatus::Pending)
         );
     });
 }
@@ -172,7 +235,7 @@ fn should_not_abort_request_with_failed_to_send_signed_tx_error() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -204,12 +267,79 @@ fn should_not_abort_request_with_failed_to_send_signed_tx_error() {
 }
 
 #[test]
+fn outgoing_zero_approval_requests_retry_on_short_cadence() {
+    let (mut ext, mut state) = ExtBuilder::default().build();
+    ext.execute_with(|| {
+        let net_id = ETH_NETWORK_ID;
+        let alice = get_account_id_from_seed::<sr25519::Public>("Alice");
+        Assets::mint_to(&XOR.into(), &alice, &alice, 100).unwrap();
+        assert_ok!(EthBridge::transfer_to_sidechain(
+            RuntimeOrigin::signed(alice.clone()),
+            XOR.into(),
+            EthAddress::from_str("19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A").unwrap(),
+            100,
+            net_id,
+        ));
+
+        state.set_should_fail_send_signed_transactions(true);
+        state.run_next_offchain_and_dispatch_txs();
+        let request_hash = last_request(net_id).unwrap().hash();
+        assert_eq!(
+            crate::RequestApprovals::<Runtime>::get(net_id, request_hash).len(),
+            0
+        );
+        let zero_approval_key = format!(
+            "{}-{:?}",
+            STORAGE_OUTGOING_ZERO_APPROVAL_REQUESTS_KEY, net_id
+        );
+        assert_eq!(
+            state.storage_read::<u64>(zero_approval_key.as_bytes()),
+            Some(1)
+        );
+        let local_peer_ready_key = format!("{}-{:?}", STORAGE_LOCAL_PEER_READY_KEY, net_id);
+        assert_eq!(
+            state.storage_read::<u64>(local_peer_ready_key.as_bytes()),
+            Some(1)
+        );
+        let failure_key = format!(
+            "{}-{:?}-{}",
+            STORAGE_OUTGOING_APPROVAL_FAILURES_KEY,
+            net_id,
+            OUTGOING_APPROVAL_FAILURE_FAILED_SEND_SIGNED_TX
+        );
+        assert_eq!(state.storage_read::<u64>(failure_key.as_bytes()), Some(1));
+        assert_eq!(state.pending_txs().len(), 1);
+        state.storage_remove(STORAGE_PENDING_TRANSACTIONS_KEY);
+
+        state.set_should_fail_send_signed_transactions(false);
+        for _ in 0..ZERO_APPROVAL_OUTGOING_RETRY_PERIOD - 2 {
+            state.run_next_offchain_and_dispatch_txs();
+            assert_eq!(
+                crate::RequestApprovals::<Runtime>::get(net_id, request_hash).len(),
+                0
+            );
+        }
+
+        state.run_next_offchain_and_dispatch_txs();
+        assert_eq!(
+            crate::RequestApprovals::<Runtime>::get(net_id, request_hash).len(),
+            1
+        );
+        state.run_next_offchain_and_dispatch_txs();
+        assert_eq!(
+            state.storage_read::<u64>(zero_approval_key.as_bytes()),
+            Some(0)
+        );
+    });
+}
+
+#[test]
 fn should_not_abort_request_when_peer_secret_key_is_missing() {
     let mut builder = ExtBuilder::new();
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -248,7 +378,7 @@ fn should_not_abort_request_when_peer_marker_does_not_match_local_key() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -292,7 +422,7 @@ fn should_not_treat_32_byte_peer_marker_value_as_legacy_secret_marker() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -641,7 +771,7 @@ fn ocw_should_retry_when_sidechain_node_params_are_missing() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -671,6 +801,37 @@ fn ocw_should_retry_when_sidechain_node_params_are_missing() {
             Some(RequestStatus::Pending)
         );
         assert!(crate::RequestsQueue::<Runtime>::get(net_id).contains(&tx_hash));
+    });
+}
+
+#[test]
+fn outgoing_approvals_do_not_depend_on_sidechain_rpc_preflight() {
+    let (mut ext, mut state) = ExtBuilder::default().build();
+    ext.execute_with(|| {
+        let net_id = ETH_NETWORK_ID;
+        let alice = get_account_id_from_seed::<sr25519::Public>("Alice");
+        Assets::mint_to(&XOR.into(), &alice, &alice, 100).unwrap();
+        assert_ok!(EthBridge::transfer_to_sidechain(
+            RuntimeOrigin::signed(alice.clone()),
+            XOR.into(),
+            EthAddress::from_str("19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A").unwrap(),
+            100,
+            net_id,
+        ));
+
+        let key = format!("{}-{:?}", STORAGE_ETH_NODE_PARAMS, net_id);
+        state.storage_remove(key.as_bytes());
+        state.run_next_offchain_and_dispatch_txs();
+
+        let request_hash = last_request(net_id).unwrap().hash();
+        assert_eq!(
+            crate::RequestApprovals::<Runtime>::get(net_id, request_hash).len(),
+            1
+        );
+        assert_eq!(
+            crate::RequestStatuses::<Runtime>::get(net_id, request_hash),
+            Some(RequestStatus::Pending)
+        );
     });
 }
 
@@ -719,7 +880,7 @@ fn should_resend_incoming_requests_from_failed_offchain_queue() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
@@ -815,7 +976,7 @@ fn ocw_should_skip_log_with_overflowing_transaction_index() {
     builder.add_network(
         vec![AssetConfig::Sidechain {
             id: XOR.into(),
-            sidechain_id: sp_core::H160::from_str("40fd72257597aa14c7231a7b1aaa29fce868f677")
+            sidechain_id: sp_core::H160::from_str("41fd72257597aa14c7231a7b1aaa29fce868f677")
                 .unwrap(),
             owned: true,
             precision: DEFAULT_BALANCE_PRECISION,
